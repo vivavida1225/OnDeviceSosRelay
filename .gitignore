@@ -56,6 +56,45 @@ yarn-error.log
 # Bundle artifact
 *.jsbundle
 
+# Android release artifacts
+*.apk
+*.aab
+*.ap_
+android/app/release/
+android/app/build/
+android/build/
+
+# Local AI model artifacts
+*.litertlm
+*.task
+*.tflite
+*.gguf
+*.ggml
+*.onnx
+*.safetensors
+*.bin
+models/
+**/models/
+android/app/src/main/assets/models/
+android/app/src/main/assets/*.litertlm
+
+# Local Gradle / Metro / tool caches
+.gradle-home/
+.gradle-temp/
+metro.log
+metro.err.log
+.metro/
+.cache/
+
+# Local device captures and debug dumps
+captures/
+recordings/
+*.pcm
+*.wav
+*.mp3
+*.m4a
+*.log
+
 # Ruby / CocoaPods
 **/Pods/
 /vendor/bundle/

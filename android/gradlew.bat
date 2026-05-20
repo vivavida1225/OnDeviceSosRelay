@@ -40,6 +40,15 @@ set APP_HOME=%DIRNAME%
 @rem Resolve any "." and ".." in APP_HOME to make it shorter.
 for %%i in ("%APP_HOME%") do set APP_HOME=%%~fi
 
+@rem Keep Gradle caches and temporary files on an ASCII-only path.
+@rem Android's Windows prefab step can break when generated batch files include non-ASCII user paths.
+set GRADLE_USER_HOME=%APP_HOME%..\..\.gradle-home
+set TEMP=%APP_HOME%..\..\.gradle-temp
+set TMP=%TEMP%
+if exist "%APP_HOME%..\..\.gradle-home\jdks\eclipse_adoptium-17-amd64-windows.2\bin\java.exe" set JAVA_HOME=%APP_HOME%..\..\.gradle-home\jdks\eclipse_adoptium-17-amd64-windows.2
+if not exist "%GRADLE_USER_HOME%" mkdir "%GRADLE_USER_HOME%"
+if not exist "%TEMP%" mkdir "%TEMP%"
+
 @rem Add default JVM options here. You can also use JAVA_OPTS and GRADLE_OPTS to pass JVM options to this script.
 set DEFAULT_JVM_OPTS="-Xmx64m" "-Xms64m"
 
