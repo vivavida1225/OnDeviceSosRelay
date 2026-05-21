@@ -77,10 +77,12 @@ models/
 **/models/
 android/app/src/main/assets/models/
 android/app/src/main/assets/*.litertlm
+android/app/libs/*.aar
 
 # Local Gradle / Metro / tool caches
 .gradle-home/
 .gradle-temp/
+.tmp/
 metro.log
 metro.err.log
 .metro/
@@ -112,3 +114,4 @@ recordings/
 !.yarn/releases
 !.yarn/sdks
 !.yarn/versions
+

@@ -23,7 +23,7 @@ class MlcGemmaNativeModule(
     val sampleRate = if (input.hasKey("sampleRate")) input.getInt("sampleRate") else 16000
     val triggerSource = input.getString("triggerSource") ?: "manual"
     val location = LiteRtGemmaAnalyzer.locationFromReadableMap(input)
-    promise.resolve(LiteRtGemmaAnalyzer.analyze(reactApplicationContext, pcmBase64, sampleRate, location, triggerSource))
+    promise.resolve(LiteRtGemmaAnalyzer.analyze(reactApplicationContext, pcmBase64, sampleRate, location, triggerSource, ""))
   }
 
   @ReactMethod

@@ -1,7 +1,8 @@
-package com.emergencycall
+﻿package com.emergencycall
 
 import android.content.Context
 import android.util.Base64
+import android.util.Log
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.ReadableMap
 import com.facebook.react.bridge.WritableMap
@@ -21,6 +22,7 @@ object LiteRtGemmaAnalyzer {
   private var warmedModelId: String = DEFAULT_MODEL_ID
   private var engine: Engine? = null
   private var engineModelPath: String? = null
+  private const val TAG = "OnGuardGemma"
 
   @Synchronized
   fun warmUp(context: Context, modelId: String): WritableMap {
@@ -45,9 +47,14 @@ object LiteRtGemmaAnalyzer {
             audioBackend = Backend.CPU(),
             cacheDir = context.cacheDir.path,
           ),
-        ).also { it.initialize() }
+        ).also {
+          Log.i(TAG, "engine_initialize_enter")
+          it.initialize()
+          Log.i(TAG, "engine_initialize_return")
+        }
         engineModelPath = modelPath
       }
+      Log.i(TAG, "warmUp_ready cached=${engineModelPath == modelPath}")
       statusMap(ready = true, mode = "litert-lm", error = null)
     }.getOrElse { error ->
       closeEngine()
@@ -65,7 +72,9 @@ object LiteRtGemmaAnalyzer {
     sampleRate: Int,
     location: LocationSnapshot?,
     triggerSource: String,
+    sttTranscript: String,
   ): WritableMap {
+    Log.i(TAG, "analyze_start sampleRate=$sampleRate base64Length=${pcmBase64.length} sttLength=${sttTranscript.length}")
     val pcmBytes = runCatching { Base64.decode(pcmBase64, Base64.NO_WRAP) }.getOrDefault(ByteArray(0))
     val warmUpStatus = warmUp(context, warmedModelId)
     if (!warmUpStatus.getBoolean("ready")) {
@@ -73,13 +82,16 @@ object LiteRtGemmaAnalyzer {
         reason = warmUpStatus.getString("error") ?: "LiteRT-LM engine is not ready.",
         location = location,
         triggerSource = triggerSource,
+        sttTranscript = sttTranscript,
       )
     }
 
-    val prompt = buildPrompt(sampleRate, pcmBytes.size, location, triggerSource)
+    val prompt = buildPrompt(sampleRate, pcmBytes.size, location, triggerSource, sttTranscript)
     val wavBytes = WavPcm.pcm16Base64ToWavBytes(pcmBytes, sampleRate)
+    Log.i(TAG, "analyze_payload_ready pcmBytes=${pcmBytes.size} wavBytes=${wavBytes.size} promptLength=${prompt.length}")
 
     return runCatching {
+      Log.i(TAG, "create_conversation_enter")
       val response = engine!!.createConversation(
         ConversationConfig(
           systemInstruction = Contents.of(
@@ -93,18 +105,19 @@ object LiteRtGemmaAnalyzer {
           ),
         ),
       ).use { conversation: Conversation ->
+        Log.i(TAG, "send_message_enter")
         conversation.sendMessage(
           Contents.of(
             Content.AudioBytes(wavBytes),
             Content.Text(prompt),
           ),
-        ).toString()
+        ).toString().also { Log.i(TAG, "send_message_return responseLength=${it.length}") }
       }
 
-      parseModelJson(response, location, triggerSource)
-        ?: failClosed("LiteRT-LM response was not valid emergency JSON: $response", location, triggerSource)
+      parseModelJson(response, location, triggerSource, sttTranscript)
+        ?: failClosed("LiteRT-LM response was not valid emergency JSON: $response", location, triggerSource, sttTranscript)
     }.getOrElse { error ->
-      failClosed(error.message ?: error.javaClass.simpleName, location, triggerSource)
+      failClosed(error.message ?: error.javaClass.simpleName, location, triggerSource, sttTranscript)
     }
   }
 
@@ -134,8 +147,10 @@ object LiteRtGemmaAnalyzer {
     pcmBytes: Int,
     location: LocationSnapshot?,
     triggerSource: String,
+    sttTranscript: String,
   ): String {
     val locationText = location?.let { "${it.latitude}, ${it.longitude}" } ?: "unknown"
+    val sttText = sttTranscript.ifBlank { "STT 인식 결과 없음" }
     return """
       첨부된 오디오는 한국어 사용자가 밤길 귀가 중 큰 소리 또는 갑작스러운 큰 움직임 트리거로 녹음된 소리입니다.
       이 트리거는 위급 상황 가능성을 알리는 신호일 뿐, 녹음이 실제 위급 상황임을 보장하지 않습니다.
@@ -151,6 +166,16 @@ object LiteRtGemmaAnalyzer {
       - sample_rate_hz: $sampleRate
       - pcm_bytes_before_wav_header: $pcmBytes
       - location: $locationText
+      - stt_transcript: $sttText
+
+      당신에게는 두 가지 단서가 동시에 주어집니다:
+      1. <stt_transcript>: 폰 내장 STT 엔진이 오디오에서 받아 적은 1차 텍스트
+      2. <audio_input>: 실제 녹음된 10초 안팎의 오디오 파형, 톤, 비명, 배경 소음
+
+      판정 지침:
+      - STT 결과에 "죽겠다", "살려줘", "미쳤나 봐" 같은 자극적인 단어가 있더라도, 오디오의 톤이 웃고 있거나, 장난치거나, 친구 간의 일상적인 대화 또는 슬랭 톤이거나, 미디어 소리라면 절대로 is_emergency를 true로 주지 마세요.
+      - STT 텍스트와 실제 오디오의 톤, 배경 소음, 긴급성이 서로 맞는지 반드시 교차 확인하세요.
+      - STT가 비어 있거나 부정확해 보여도 실제 오디오에서 비명, 협박, 추격, 폭행 정황이 명확하면 오디오 단서를 우선 고려하세요.
 
       판단 기준:
       - 명확한 도움 요청, 비명, 협박, 폭행/추격/스토킹/성범죄/납치 정황, 위험한 충격음이 있으면 is_emergency를 true로 판단하세요.
@@ -158,6 +183,7 @@ object LiteRtGemmaAnalyzer {
       - 위험 단서가 애매하면 false로 판단하고, situation_summary에는 "위급 상황으로 판단할 객관적 단서가 부족합니다."라고 작성하세요.
       - recognized_dialogue에는 들린 한국어 발화 또는 주요 소리를 간결하게 적으세요.
       - 말이 알아들을 수 없으면 recognized_dialogue는 "음성 인식 불가"로 적으세요.
+      - stt_transcript는 참고 단서일 뿐이며, recognized_dialogue와 다를 수 있습니다.
       - situation_summary에는 들린 말을 그대로 복사하지 마세요.
       - situation_summary는 한국 경찰 112 문자 신고에 넣을 수 있도록 사용자가 처한 상황을 추정해 한 문장으로 서술하세요.
       - 예: "따라오지 마세요"가 들리면 "사용자가 누군가에게 따라오지 말라고 반복적으로 말하고 있어 스토킹 또는 접근 위협 상황으로 보입니다."처럼 작성하세요.
@@ -174,6 +200,7 @@ object LiteRtGemmaAnalyzer {
     response: String,
     location: LocationSnapshot?,
     triggerSource: String,
+    sttTranscript: String,
   ): WritableMap? {
     val jsonText = response.substringAfter('{', "").substringBeforeLast('}', "")
     if (jsonText.isBlank()) return null
@@ -184,6 +211,7 @@ object LiteRtGemmaAnalyzer {
       putString("crime_type", json.optString("crime_type", "unknown"))
       putString("situation_summary", json.optString("situation_summary", "상황 요약 없음"))
       putString("recognized_dialogue", json.optString("recognized_dialogue", "음성 인식 불가"))
+      putString("stt_transcript", sttTranscript)
       putString("model_id", warmedModelId)
       putString("analysis_mode", "litert-lm")
       putString("trigger_source", triggerSource)
@@ -201,12 +229,14 @@ object LiteRtGemmaAnalyzer {
     reason: String,
     location: LocationSnapshot?,
     triggerSource: String,
+    sttTranscript: String = "",
   ): WritableMap =
     Arguments.createMap().apply {
       putBoolean("is_emergency", false)
       putString("crime_type", "unknown")
       putString("situation_summary", "LiteRT-LM 분석을 완료하지 못했습니다: $reason")
       putString("recognized_dialogue", "analysis_failed")
+      putString("stt_transcript", sttTranscript)
       putString("model_id", warmedModelId)
       putString("analysis_mode", "litert-lm_unavailable")
       putString("trigger_source", triggerSource)
@@ -227,3 +257,5 @@ object LiteRtGemmaAnalyzer {
       error?.let { putString("error", it) }
     }
 }
+
+

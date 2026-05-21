@@ -1,4 +1,4 @@
-import {NativeEventEmitter, NativeModules, Platform} from 'react-native';
+﻿import {NativeEventEmitter, NativeModules, Platform} from 'react-native';
 
 export type EmergencyLocation = {
   latitude: number;
@@ -15,6 +15,9 @@ export type EmergencyAnalysis = {
   analysis_mode?: string;
   litert_error?: string;
   recognized_dialogue?: string;
+  stt_transcript?: string;
+  stt_engine?: string;
+  stt_error?: string;
   raw_model_response?: string;
 };
 
@@ -22,6 +25,7 @@ export type MonitoringConfig = {
   modelId: string;
   sensorThreshold: number;
   audioRmsThreshold: number;
+  sttEnabled: boolean;
 };
 
 type EmergencyNativeModule = {
@@ -86,3 +90,4 @@ export const emergencyEvents =
   Platform.OS === 'android' && NativeModules.EmergencyNative
     ? new NativeEventEmitter(NativeModules.EmergencyNative)
     : undefined;
+

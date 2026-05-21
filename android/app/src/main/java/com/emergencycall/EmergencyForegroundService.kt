@@ -1,4 +1,4 @@
-package com.emergencycall
+﻿package com.emergencycall
 
 import android.Manifest
 import android.app.Notification
@@ -22,6 +22,7 @@ import android.os.Build
 import android.os.IBinder
 import android.os.SystemClock
 import android.util.Base64
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.facebook.react.bridge.Arguments
@@ -39,6 +40,7 @@ class EmergencyForegroundService : Service(), SensorEventListener {
   private var ringWriteIndex = 0
   private var sensorThreshold = 28.0
   private var audioRmsThreshold = 0.35
+  private var sttEnabled = true
   private var lastReadSize = 0
   private var lastReadRms = 0.0
   private var lastReadPeak = 0.0
@@ -92,14 +94,19 @@ class EmergencyForegroundService : Service(), SensorEventListener {
   private fun startMonitoring(intent: Intent) {
     sensorThreshold = intent.getDoubleExtra(EXTRA_SENSOR_THRESHOLD, 28.0)
     audioRmsThreshold = intent.getDoubleExtra(EXTRA_AUDIO_RMS_THRESHOLD, 0.35)
-    LiteRtGemmaAnalyzer.warmUp(this, intent.getStringExtra(EXTRA_MODEL_ID) ?: "gemma-4-E4B-it")
+    sttEnabled = intent.getBooleanExtra(EXTRA_STT_ENABLED, true)
+    Log.i(TAG, "startMonitoring: sttEnabled=$sttEnabled")
+    val modelId = intent.getStringExtra(EXTRA_MODEL_ID) ?: "gemma-4-E4B-it"
+    Log.i(TAG, "startMonitoring: warmUp requested modelId=$modelId monitoring=$monitoring")
+    val warmUpResult = LiteRtGemmaAnalyzer.warmUp(this, modelId)
+    Log.i(TAG, "startMonitoring: warmUp finished ready=${warmUpResult.getBoolean("ready")} mode=${warmUpResult.getString("mode")} error=${if (warmUpResult.hasKey("error")) warmUpResult.getString("error") else null}")
 
     if (monitoring) {
       triggerLocked = false
       val event = Arguments.createMap()
       event.putString("status", "monitoring")
       event.putString("reason", "already_monitoring_rearmed")
-      event.putString("model_id", intent.getStringExtra(EXTRA_MODEL_ID) ?: "gemma-4-E4B-it")
+      event.putString("model_id", modelId)
       EmergencyEventBus.emit("serviceStatus", event)
       return
     }
@@ -112,7 +119,7 @@ class EmergencyForegroundService : Service(), SensorEventListener {
 
     val event = Arguments.createMap()
     event.putString("status", "monitoring")
-    event.putString("model_id", intent.getStringExtra(EXTRA_MODEL_ID) ?: "gemma-4-E4B-it")
+    event.putString("model_id", modelId)
     EmergencyEventBus.emit("serviceStatus", event)
   }
 
@@ -269,15 +276,51 @@ class EmergencyForegroundService : Service(), SensorEventListener {
       )
 
       emitAnalysisDebug(
+        "stt_call_started",
+        Arguments.createMap().apply {
+          putString("message", "STT 호출 시작")
+          putString("trigger_source", source)
+          putString("stt_engine", "sherpa-onnx-whisper-tiny-int8")
+        },
+      )
+
+      val sttResult = if (sttEnabled) {
+        Log.i(TAG, "stt_transcribe_call_enter source=$source")
+        SherpaOnnxWhisperSttAnalyzer.transcribe(this, audioSnapshot.base64, sampleRate).also {
+          Log.i(TAG, "stt_transcribe_call_return transcriptLength=${it.transcript.length} error=${it.error}")
+        }
+      } else {
+        Log.i(TAG, "stt_transcribe_skipped source=$source")
+        SttResult(transcript = "", engine = "disabled", error = null, elapsedMs = 0)
+      }
+      emitAnalysisDebug(
+        if (sttEnabled) "stt_call_completed" else "stt_call_skipped",
+        Arguments.createMap().apply {
+          putString("message", if (sttEnabled) "STT 호출 완료" else "STT 비활성화로 호출 생략")
+          putString("trigger_source", source)
+          putString("stt_engine", sttResult.engine)
+          putString("stt_transcript", sttResult.transcript)
+          putInt("stt_elapsed_ms", sttResult.elapsedMs)
+          putBoolean("stt_enabled", sttEnabled)
+          sttResult.error?.let { putString("stt_error", it) }
+        },
+      )
+
+      emitAnalysisDebug(
         "ai_call_started",
         Arguments.createMap().apply {
           putString("message", "AI 호출 시작")
           putString("trigger_source", source)
+          putString("stt_transcript", sttResult.transcript)
+          sttResult.error?.let { putString("stt_error", it) }
         },
       )
 
       val startedAt = SystemClock.elapsedRealtime()
-      val result = LiteRtGemmaAnalyzer.analyze(this, audioSnapshot.base64, sampleRate, location, source)
+      val result = LiteRtGemmaAnalyzer.analyze(this, audioSnapshot.base64, sampleRate, location, source, sttResult.transcript)
+      result.putString("stt_transcript", sttResult.transcript)
+      result.putString("stt_engine", sttResult.engine)
+      sttResult.error?.let { result.putString("stt_error", it) }
       val elapsedMs = (SystemClock.elapsedRealtime() - startedAt).toInt()
       val isEmergency = result.getBoolean("is_emergency")
 
@@ -292,6 +335,9 @@ class EmergencyForegroundService : Service(), SensorEventListener {
           if (result.hasKey("recognized_dialogue")) {
             putString("recognized_dialogue", result.getString("recognized_dialogue"))
           }
+          if (result.hasKey("stt_transcript")) putString("stt_transcript", result.getString("stt_transcript"))
+          if (result.hasKey("stt_engine")) putString("stt_engine", result.getString("stt_engine"))
+          if (result.hasKey("stt_error")) putString("stt_error", result.getString("stt_error"))
           if (result.hasKey("model_id")) putString("model_id", result.getString("model_id"))
           if (result.hasKey("analysis_mode")) putString("analysis_mode", result.getString("analysis_mode"))
           if (result.hasKey("trigger_source")) putString("trigger_source", result.getString("trigger_source"))
@@ -458,6 +504,8 @@ class EmergencyForegroundService : Service(), SensorEventListener {
     const val EXTRA_SENSOR_THRESHOLD = "sensorThreshold"
     const val EXTRA_AUDIO_RMS_THRESHOLD = "audioRmsThreshold"
     const val EXTRA_MODEL_ID = "modelId"
+    const val EXTRA_STT_ENABLED = "sttEnabled"
+    private const val TAG = "OnGuardEmergency"
     private const val CHANNEL_ID = "emergency_monitoring"
     private const val NOTIFICATION_ID = 11201
     private const val AUDIO_NON_SILENT_THRESHOLD = 128
@@ -483,3 +531,5 @@ private data class AudioSnapshot(
   val lastNonSilentOffsetMs: Int,
   val lastAudioReadAgeMs: Int,
 )
+
+

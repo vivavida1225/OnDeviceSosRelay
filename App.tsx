@@ -1,4 +1,4 @@
-import React, {useCallback, useEffect, useReducer, useRef, useState} from 'react';
+﻿import React, {useCallback, useEffect, useReducer, useRef, useState} from 'react';
 import {
   Alert,
   Modal,
@@ -8,6 +8,7 @@ import {
   SafeAreaView,
   ScrollView,
   StatusBar,
+  Switch,
   StyleSheet,
   Text,
   useColorScheme,
@@ -25,7 +26,7 @@ import {
   initialEmergencyState,
 } from './src/state/emergencyState';
 
-const monitoringConfig = {
+const baseMonitoringConfig = {
   modelId: 'gemma-4-E4B-it',
   sensorThreshold: 28,
   audioRmsThreshold: 0.35,
@@ -44,6 +45,9 @@ function App() {
   );
   const [analysisLogs, setAnalysisLogs] = useState<AnalysisLogEntry[]>([]);
   const [logsVisible, setLogsVisible] = useState(false);
+  const [menuVisible, setMenuVisible] = useState(false);
+  const [settingsVisible, setSettingsVisible] = useState(false);
+  const [sttEnabled, setSttEnabled] = useState(true);
   const smsSentForAnalysis = useRef<EmergencyAnalysis | undefined>(undefined);
 
   useEffect(() => {
@@ -160,16 +164,17 @@ function App() {
     try {
       dispatch({type: 'START_REQUESTED'});
       await requestAndroidPermissions();
-      const warmUpStatus = await MlcGemmaNative.warmUp(monitoringConfig.modelId);
+      const config = {...baseMonitoringConfig, sttEnabled};
+      const warmUpStatus = await MlcGemmaNative.warmUp(config.modelId);
       console.log('[EmergencyDebug] warmUp', warmUpStatus);
-      await EmergencyNative.startMonitoring(monitoringConfig);
+      await EmergencyNative.startMonitoring(config);
     } catch (error) {
       dispatch({
         type: 'ERROR',
         message: error instanceof Error ? error.message : '시작 실패',
       });
     }
-  }, []);
+  }, [sttEnabled]);
 
   const stopMonitoring = useCallback(async () => {
     await EmergencyNative.stopMonitoring();
@@ -207,6 +212,25 @@ function App() {
     state.mode === 'analyzing' ||
     state.mode === 'countdown';
 
+  const updateSttEnabled = useCallback(
+    async (enabled: boolean) => {
+      setSttEnabled(enabled);
+      if (!isMonitoring) {
+        return;
+      }
+
+      try {
+        await EmergencyNative.startMonitoring({
+          ...baseMonitoringConfig,
+          sttEnabled: enabled,
+        });
+      } catch (error) {
+        console.warn('[EmergencyDebug] updateSttEnabled failed', error);
+      }
+    },
+    [isMonitoring],
+  );
+
   return (
     <SafeAreaView style={styles.safeArea}>
       <StatusBar barStyle={isDarkMode ? 'light-content' : 'dark-content'} />
@@ -214,8 +238,8 @@ function App() {
         <View style={styles.header}>
           <Pressable
             style={styles.logButton}
-            onPress={() => setLogsVisible(true)}>
-            <Text style={styles.logButtonText}>로그 보기</Text>
+            onPress={() => setMenuVisible(true)}>
+            <Text style={styles.logButtonText}>메뉴</Text>
           </Pressable>
           <Text style={styles.eyebrow}>On-device prototype</Text>
           <Text style={styles.title}>AI 안심 귀가</Text>
@@ -272,6 +296,62 @@ function App() {
         </View>
       </Modal>
 
+
+
+      <Modal visible={menuVisible} transparent animationType="fade">
+        <View style={styles.modalBackdrop}>
+          <View style={styles.menuCard}>
+            <Text style={styles.menuTitle}>메뉴</Text>
+            <Pressable
+              style={styles.menuOption}
+              onPress={() => {
+                setMenuVisible(false);
+                setLogsVisible(true);
+              }}>
+              <Text style={styles.menuOptionText}>로그 보기</Text>
+            </Pressable>
+            <Pressable
+              style={styles.menuOption}
+              onPress={() => {
+                setMenuVisible(false);
+                setSettingsVisible(true);
+              }}>
+              <Text style={styles.menuOptionText}>설정</Text>
+            </Pressable>
+            <Pressable
+              style={styles.menuCloseButton}
+              onPress={() => setMenuVisible(false)}>
+              <Text style={styles.menuCloseButtonText}>닫기</Text>
+            </Pressable>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={settingsVisible} transparent animationType="fade">
+        <View style={styles.modalBackdrop}>
+          <View style={styles.menuCard}>
+            <Text style={styles.menuTitle}>설정</Text>
+            <View style={styles.settingRow}>
+              <View style={styles.settingTextGroup}>
+                <Text style={styles.settingLabel}>STT 기능</Text>
+                <Text style={styles.settingDescription}>
+                  Sherpa-ONNX Whisper 받아쓰기 채널을 켜거나 끕니다.
+                </Text>
+              </View>
+              <Switch value={sttEnabled} onValueChange={updateSttEnabled} />
+            </View>
+            <Text style={styles.settingHint}>
+              감시 중 변경하면 다음 트리거부터 적용됩니다.
+            </Text>
+            <Pressable
+              style={styles.menuCloseButton}
+              onPress={() => setSettingsVisible(false)}>
+              <Text style={styles.menuCloseButtonText}>닫기</Text>
+            </Pressable>
+          </View>
+        </View>
+      </Modal>
+
       <Modal visible={logsVisible} animationType="slide">
         <SafeAreaView style={styles.logsScreen}>
           <View style={styles.logsHeader}>
@@ -307,6 +387,12 @@ function App() {
                     label="recognized_dialogue"
                     value={log.recognized_dialogue}
                   />
+                  <LogRow
+                    label="stt_transcript"
+                    value={log.stt_transcript}
+                  />
+                  <LogRow label="stt_engine" value={log.stt_engine} />
+                  <LogRow label="stt_error" value={log.stt_error} />
                   <LogRow
                     label="situation_summary"
                     value={log.situation_summary}
@@ -550,6 +636,72 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '900',
   },
+
+  menuCard: {
+    width: '100%',
+    maxWidth: 420,
+    backgroundColor: '#ffffff',
+    borderRadius: 8,
+    padding: 18,
+    gap: 12,
+  },
+  menuTitle: {
+    color: '#111827',
+    fontSize: 22,
+    fontWeight: '900',
+  },
+  menuOption: {
+    backgroundColor: '#ffffff',
+    borderColor: '#d1d5db',
+    borderWidth: 1,
+    borderRadius: 8,
+    minHeight: 50,
+    justifyContent: 'center',
+    paddingHorizontal: 14,
+  },
+  menuOptionText: {
+    color: '#111827',
+    fontSize: 16,
+    fontWeight: '800',
+  },
+  menuCloseButton: {
+    backgroundColor: '#111827',
+    borderRadius: 8,
+    minHeight: 48,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  menuCloseButtonText: {
+    color: '#ffffff',
+    fontSize: 15,
+    fontWeight: '900',
+  },
+  settingRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 16,
+    paddingVertical: 8,
+  },
+  settingTextGroup: {
+    flex: 1,
+    gap: 4,
+  },
+  settingLabel: {
+    color: '#111827',
+    fontSize: 16,
+    fontWeight: '900',
+  },
+  settingDescription: {
+    color: '#4b5563',
+    fontSize: 13,
+    lineHeight: 19,
+  },
+  settingHint: {
+    color: '#6b7280',
+    fontSize: 12,
+    lineHeight: 18,
+  },
   logsScreen: {
     flex: 1,
     backgroundColor: '#f7f8fb',
@@ -628,3 +780,4 @@ const styles = StyleSheet.create({
 });
 
 export default App;
+

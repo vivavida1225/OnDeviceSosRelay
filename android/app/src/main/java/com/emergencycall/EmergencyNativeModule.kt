@@ -1,4 +1,4 @@
-package com.emergencycall
+﻿package com.emergencycall
 
 import android.Manifest
 import android.content.Context
@@ -23,8 +23,13 @@ class EmergencyNativeModule(
     reactContext.getSharedPreferences("onguard_ai_prefs", Context.MODE_PRIVATE)
   }
 
+  init {
+    SherpaOnnxWhisperSttAnalyzer.ensureModelDirectories(reactContext)
+  }
+
   @ReactMethod
   fun startMonitoring(config: ReadableMap, promise: Promise) {
+    SherpaOnnxWhisperSttAnalyzer.ensureModelDirectories(reactContext)
     val intent = Intent(reactContext, EmergencyForegroundService::class.java).apply {
       action = EmergencyForegroundService.ACTION_START
       putExtra(
@@ -38,6 +43,10 @@ class EmergencyNativeModule(
       putExtra(
         EmergencyForegroundService.EXTRA_MODEL_ID,
         config.getString("modelId") ?: "gemma-4-E4B-it",
+      )
+      putExtra(
+        EmergencyForegroundService.EXTRA_STT_ENABLED,
+        if (config.hasKey("sttEnabled")) config.getBoolean("sttEnabled") else true,
       )
     }
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -154,3 +163,5 @@ class EmergencyNativeModule(
       putInt("parts", parts)
     }
 }
+
+
