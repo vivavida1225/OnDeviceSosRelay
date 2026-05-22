@@ -26,6 +26,21 @@ export type MonitoringConfig = {
   sensorThreshold: number;
   audioRmsThreshold: number;
   sttEnabled: boolean;
+  customPrompt?: string;
+};
+
+export type AppSettings = {
+  sttEnabled: boolean;
+  customPrompt: string;
+};
+
+export type AudioLogEntry = {
+  id: string;
+  createdAt: string | number;
+  trigger_source: string;
+  duration_seconds: number;
+  sample_rate: number;
+  file_name: string;
 };
 
 type EmergencyNativeModule = {
@@ -37,6 +52,11 @@ type EmergencyNativeModule = {
   stopSiren(): Promise<boolean>;
   loadAnalysisLogs(): Promise<string>;
   saveAnalysisLogs(logsJson: string): Promise<boolean>;
+  loadAppSettings(): Promise<string>;
+  saveAppSettings(settingsJson: string): Promise<boolean>;
+  loadAudioLogs(): Promise<string>;
+  playAudioLog(id: string): Promise<boolean>;
+  stopAudioLog(): Promise<boolean>;
   sendEmergencySms(payload: {
     destination: string;
     situation_summary: string;
@@ -75,6 +95,11 @@ export const EmergencyNative: EmergencyNativeModule =
         stopSiren: () => missingModule('EmergencyNative'),
         loadAnalysisLogs: () => missingModule('EmergencyNative'),
         saveAnalysisLogs: () => missingModule('EmergencyNative'),
+        loadAppSettings: () => missingModule('EmergencyNative'),
+        saveAppSettings: () => missingModule('EmergencyNative'),
+        loadAudioLogs: () => missingModule('EmergencyNative'),
+        playAudioLog: () => missingModule('EmergencyNative'),
+        stopAudioLog: () => missingModule('EmergencyNative'),
         sendEmergencySms: () => missingModule('EmergencyNative'),
       };
 
@@ -90,4 +115,7 @@ export const emergencyEvents =
   Platform.OS === 'android' && NativeModules.EmergencyNative
     ? new NativeEventEmitter(NativeModules.EmergencyNative)
     : undefined;
+
+
+
 

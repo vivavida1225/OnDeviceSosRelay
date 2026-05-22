@@ -40,7 +40,8 @@ class EmergencyForegroundService : Service(), SensorEventListener {
   private var ringWriteIndex = 0
   private var sensorThreshold = 28.0
   private var audioRmsThreshold = 0.35
-  private var sttEnabled = true
+  private var sttEnabled = false
+  private var customPrompt = ""
   private var lastReadSize = 0
   private var lastReadRms = 0.0
   private var lastReadPeak = 0.0
@@ -94,7 +95,8 @@ class EmergencyForegroundService : Service(), SensorEventListener {
   private fun startMonitoring(intent: Intent) {
     sensorThreshold = intent.getDoubleExtra(EXTRA_SENSOR_THRESHOLD, 28.0)
     audioRmsThreshold = intent.getDoubleExtra(EXTRA_AUDIO_RMS_THRESHOLD, 0.35)
-    sttEnabled = intent.getBooleanExtra(EXTRA_STT_ENABLED, true)
+    sttEnabled = intent.getBooleanExtra(EXTRA_STT_ENABLED, false)
+    customPrompt = intent.getStringExtra(EXTRA_CUSTOM_PROMPT) ?: ""
     Log.i(TAG, "startMonitoring: sttEnabled=$sttEnabled")
     val modelId = intent.getStringExtra(EXTRA_MODEL_ID) ?: "gemma-4-E4B-it"
     Log.i(TAG, "startMonitoring: warmUp requested modelId=$modelId monitoring=$monitoring")
@@ -231,6 +233,27 @@ class EmergencyForegroundService : Service(), SensorEventListener {
 
       val location = currentLocation()
       val audioSnapshot = readRingBufferSnapshot()
+      val audioLog = runCatching {
+        AudioLogStore.save(
+          context = this,
+          pcmBase64 = audioSnapshot.fullBase64,
+          sampleRate = sampleRate,
+          triggerSource = source,
+          sentStartOffsetMs = audioSnapshot.sentStartOffsetMs,
+          sentEndOffsetMs = audioSnapshot.sentEndOffsetMs,
+        )
+      }.getOrNull()
+      audioLog?.let {
+        emitAnalysisDebug(
+          "audio_log_saved",
+          Arguments.createMap().apply {
+            putString("message", "오디오 로그 저장 완료")
+            putString("audio_log_id", it.optString("id"))
+            putString("trigger_source", source)
+            putDouble("duration_seconds", it.optDouble("duration_seconds"))
+          },
+        )
+      }
 
       emitAnalysisDebug(
         "audio_extracted",
@@ -317,7 +340,7 @@ class EmergencyForegroundService : Service(), SensorEventListener {
       )
 
       val startedAt = SystemClock.elapsedRealtime()
-      val result = LiteRtGemmaAnalyzer.analyze(this, audioSnapshot.base64, sampleRate, location, source, sttResult.transcript)
+      val result = LiteRtGemmaAnalyzer.analyze(this, audioSnapshot.base64, sampleRate, location, source, sttResult.transcript, customPrompt)
       result.putString("stt_transcript", sttResult.transcript)
       result.putString("stt_engine", sttResult.engine)
       sttResult.error?.let { result.putString("stt_error", it) }
@@ -392,6 +415,12 @@ class EmergencyForegroundService : Service(), SensorEventListener {
       if (lastNonSilentIndex >= 0) minOf(snapshot.size, lastNonSilentIndex + trimPaddingSamples + 1) else snapshot.size
     val sentSamples = snapshot.copyOfRange(trimStart, trimEndExclusive)
 
+    val fullBytes = ByteArray(snapshot.size * 2)
+    snapshot.forEachIndexed { index, sample ->
+      fullBytes[index * 2] = (sample.toInt() and 0xff).toByte()
+      fullBytes[index * 2 + 1] = ((sample.toInt() shr 8) and 0xff).toByte()
+    }
+
     val bytes = ByteArray(sentSamples.size * 2)
     sentSamples.forEachIndexed { index, sample ->
       bytes[index * 2] = (sample.toInt() and 0xff).toByte()
@@ -399,6 +428,8 @@ class EmergencyForegroundService : Service(), SensorEventListener {
     }
     return AudioSnapshot(
       base64 = Base64.encodeToString(bytes, Base64.NO_WRAP),
+      fullBase64 = Base64.encodeToString(fullBytes, Base64.NO_WRAP),
+      fullPcmBytes = fullBytes.size,
       sampleCount = capturedSamples,
       sentSampleCount = sentSamples.size,
       pcmBytes = bytes.size,
@@ -505,6 +536,7 @@ class EmergencyForegroundService : Service(), SensorEventListener {
     const val EXTRA_AUDIO_RMS_THRESHOLD = "audioRmsThreshold"
     const val EXTRA_MODEL_ID = "modelId"
     const val EXTRA_STT_ENABLED = "sttEnabled"
+    const val EXTRA_CUSTOM_PROMPT = "customPrompt"
     private const val TAG = "OnGuardEmergency"
     private const val CHANNEL_ID = "emergency_monitoring"
     private const val NOTIFICATION_ID = 11201
@@ -516,6 +548,8 @@ class EmergencyForegroundService : Service(), SensorEventListener {
 
 private data class AudioSnapshot(
   val base64: String,
+  val fullBase64: String,
+  val fullPcmBytes: Int,
   val sampleCount: Int,
   val sentSampleCount: Int,
   val pcmBytes: Int,
@@ -531,5 +565,12 @@ private data class AudioSnapshot(
   val lastNonSilentOffsetMs: Int,
   val lastAudioReadAgeMs: Int,
 )
+
+
+
+
+
+
+
 
 

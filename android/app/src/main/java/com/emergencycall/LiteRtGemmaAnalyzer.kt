@@ -73,6 +73,7 @@ object LiteRtGemmaAnalyzer {
     location: LocationSnapshot?,
     triggerSource: String,
     sttTranscript: String,
+    customPrompt: String = "",
   ): WritableMap {
     Log.i(TAG, "analyze_start sampleRate=$sampleRate base64Length=${pcmBase64.length} sttLength=${sttTranscript.length}")
     val pcmBytes = runCatching { Base64.decode(pcmBase64, Base64.NO_WRAP) }.getOrDefault(ByteArray(0))
@@ -86,7 +87,7 @@ object LiteRtGemmaAnalyzer {
       )
     }
 
-    val prompt = buildPrompt(sampleRate, pcmBytes.size, location, triggerSource, sttTranscript)
+    val prompt = buildPrompt(sampleRate, pcmBytes.size, location, triggerSource, sttTranscript, customPrompt)
     val wavBytes = WavPcm.pcm16Base64ToWavBytes(pcmBytes, sampleRate)
     Log.i(TAG, "analyze_payload_ready pcmBytes=${pcmBytes.size} wavBytes=${wavBytes.size} promptLength=${prompt.length}")
 
@@ -148,9 +149,11 @@ object LiteRtGemmaAnalyzer {
     location: LocationSnapshot?,
     triggerSource: String,
     sttTranscript: String,
+    customPrompt: String,
   ): String {
     val locationText = location?.let { "${it.latitude}, ${it.longitude}" } ?: "unknown"
     val sttText = sttTranscript.ifBlank { "STT 인식 결과 없음" }
+    val customPromptText = customPrompt.trim().ifBlank { "개인화 추가 지침 없음" }
     return """
       첨부된 오디오는 한국어 사용자가 밤길 귀가 중 큰 소리 또는 갑작스러운 큰 움직임 트리거로 녹음된 소리입니다.
       이 트리거는 위급 상황 가능성을 알리는 신호일 뿐, 녹음이 실제 위급 상황임을 보장하지 않습니다.
@@ -190,6 +193,10 @@ object LiteRtGemmaAnalyzer {
       - 예: "도와주세요"가 들리면 "사용자가 도움을 요청하고 있어 신체적 위협 또는 긴급 구조가 필요한 상황으로 보입니다."처럼 작성하세요.
       - 예: "가까이 오지 마세요"가 들리면 "사용자가 상대에게 접근하지 말라고 말하고 있어 대면 위협 상황으로 보입니다."처럼 작성하세요.
       - 충분히 확실하지 않으면 단정하지 말고 "~으로 보입니다", "~가능성이 있습니다"처럼 표현하세요.
+
+      사용자 개인화 프롬프트:
+      - 아래 사용자 개인화 지침이 기본 지침보다 우선합니다.
+      - 개인화 지침: $customPromptText
 
       아래 JSON만 반환하세요:
       {"is_emergency": boolean, "crime_type": string, "situation_summary": string, "recognized_dialogue": string}
@@ -257,5 +264,6 @@ object LiteRtGemmaAnalyzer {
       error?.let { putString("error", it) }
     }
 }
+
 
 

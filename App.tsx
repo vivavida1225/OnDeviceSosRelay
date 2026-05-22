@@ -11,6 +11,7 @@ import {
   Switch,
   StyleSheet,
   Text,
+  TextInput,
   useColorScheme,
   Vibration,
   View,
@@ -19,6 +20,8 @@ import {
   EmergencyNative,
   emergencyEvents,
   MlcGemmaNative,
+  type AppSettings,
+  type AudioLogEntry,
   type EmergencyAnalysis,
 } from './src/native/EmergencyNative';
 import {
@@ -32,6 +35,14 @@ const baseMonitoringConfig = {
   audioRmsThreshold: 0.35,
 };
 
+const DEFAULT_CUSTOM_PROMPT = `기본 프롬프트를 사용합니다.
+오디오와 STT 결과가 서로 충돌하면 실제 오디오의 톤, 긴급성, 배경 소음을 우선해 판단하세요.
+위급 상황 단서가 부족하면 보수적으로 false를 반환하세요.`;
+
+const defaultAppSettings: AppSettings = {
+  sttEnabled: false,
+  customPrompt: DEFAULT_CUSTOM_PROMPT,
+};
 type AnalysisLogEntry = EmergencyAnalysis & {
   id: string;
   createdAt: string;
@@ -47,7 +58,13 @@ function App() {
   const [logsVisible, setLogsVisible] = useState(false);
   const [menuVisible, setMenuVisible] = useState(false);
   const [settingsVisible, setSettingsVisible] = useState(false);
-  const [sttEnabled, setSttEnabled] = useState(true);
+  const [personalizationVisible, setPersonalizationVisible] = useState(false);
+  const [audioLogsVisible, setAudioLogsVisible] = useState(false);
+  const [audioLogs, setAudioLogs] = useState<AudioLogEntry[]>([]);
+  const [playingAudioId, setPlayingAudioId] = useState<string>();
+  const [sttEnabled, setSttEnabled] = useState(defaultAppSettings.sttEnabled);
+  const [customPrompt, setCustomPrompt] = useState(defaultAppSettings.customPrompt);
+  const [promptDraft, setPromptDraft] = useState(defaultAppSettings.customPrompt);
   const smsSentForAnalysis = useRef<EmergencyAnalysis | undefined>(undefined);
 
   useEffect(() => {
@@ -62,7 +79,24 @@ function App() {
         console.warn('[EmergencyDebug] loadAnalysisLogs failed', error);
       });
   }, []);
-
+  useEffect(() => {
+    EmergencyNative.loadAppSettings()
+      .then(settingsJson => {
+        const parsed = JSON.parse(settingsJson) as Partial<AppSettings>;
+        const nextSettings = {
+          ...defaultAppSettings,
+          ...parsed,
+          sttEnabled: parsed.sttEnabled ?? defaultAppSettings.sttEnabled,
+          customPrompt: parsed.customPrompt || defaultAppSettings.customPrompt,
+        };
+        setSttEnabled(nextSettings.sttEnabled);
+        setCustomPrompt(nextSettings.customPrompt);
+        setPromptDraft(nextSettings.customPrompt);
+      })
+      .catch(error => {
+        console.warn('[EmergencyDebug] loadAppSettings failed', error);
+      });
+  }, []);
   useEffect(() => {
     if (!emergencyEvents) {
       return;
@@ -160,11 +194,52 @@ function App() {
     }
   }, [state.analysis, state.countdown, state.mode]);
 
+  const saveSettings = useCallback(async (nextSettings: AppSettings) => {
+    await EmergencyNative.saveAppSettings(JSON.stringify(nextSettings));
+  }, []);
+
+  const refreshAudioLogs = useCallback(async () => {
+    try {
+      const logsJson = await EmergencyNative.loadAudioLogs();
+      const logs = JSON.parse(logsJson);
+      setAudioLogs(Array.isArray(logs) ? logs.slice(0, 3) : []);
+    } catch (error) {
+      console.warn('[EmergencyDebug] loadAudioLogs failed', error);
+      setAudioLogs([]);
+    }
+  }, []);
+
+  const openAudioLogs = useCallback(async () => {
+    setMenuVisible(false);
+    await refreshAudioLogs();
+    setAudioLogsVisible(true);
+  }, [refreshAudioLogs]);
+
+  const playAudioLog = useCallback(async (id: string) => {
+    const started = await EmergencyNative.playAudioLog(id);
+    setPlayingAudioId(started ? id : undefined);
+  }, []);
+
+  const stopAudioLog = useCallback(async () => {
+    await EmergencyNative.stopAudioLog();
+    setPlayingAudioId(undefined);
+  }, []);
+
+  const savePrompt = useCallback(async () => {
+    const nextPrompt = promptDraft.trim() || defaultAppSettings.customPrompt;
+    setCustomPrompt(nextPrompt);
+    await saveSettings({sttEnabled, customPrompt: nextPrompt});
+    setPersonalizationVisible(false);
+  }, [promptDraft, saveSettings, sttEnabled]);
+
+  const restoreDefaultPrompt = useCallback(() => {
+    setPromptDraft(defaultAppSettings.customPrompt);
+  }, []);
   const startMonitoring = useCallback(async () => {
     try {
       dispatch({type: 'START_REQUESTED'});
       await requestAndroidPermissions();
-      const config = {...baseMonitoringConfig, sttEnabled};
+      const config = {...baseMonitoringConfig, sttEnabled, customPrompt};
       const warmUpStatus = await MlcGemmaNative.warmUp(config.modelId);
       console.log('[EmergencyDebug] warmUp', warmUpStatus);
       await EmergencyNative.startMonitoring(config);
@@ -174,7 +249,7 @@ function App() {
         message: error instanceof Error ? error.message : '시작 실패',
       });
     }
-  }, [sttEnabled]);
+  }, [customPrompt, sttEnabled]);
 
   const stopMonitoring = useCallback(async () => {
     await EmergencyNative.stopMonitoring();
@@ -215,6 +290,7 @@ function App() {
   const updateSttEnabled = useCallback(
     async (enabled: boolean) => {
       setSttEnabled(enabled);
+      await saveSettings({sttEnabled: enabled, customPrompt});
       if (!isMonitoring) {
         return;
       }
@@ -223,14 +299,14 @@ function App() {
         await EmergencyNative.startMonitoring({
           ...baseMonitoringConfig,
           sttEnabled: enabled,
+          customPrompt,
         });
       } catch (error) {
         console.warn('[EmergencyDebug] updateSttEnabled failed', error);
       }
     },
-    [isMonitoring],
+    [customPrompt, isMonitoring, saveSettings],
   );
-
   return (
     <SafeAreaView style={styles.safeArea}>
       <StatusBar barStyle={isDarkMode ? 'light-content' : 'dark-content'} />
@@ -308,7 +384,10 @@ function App() {
                 setMenuVisible(false);
                 setLogsVisible(true);
               }}>
-              <Text style={styles.menuOptionText}>로그 보기</Text>
+              <Text style={styles.menuOptionText}>분석 로그 보기</Text>
+            </Pressable>
+            <Pressable style={styles.menuOption} onPress={openAudioLogs}>
+              <Text style={styles.menuOptionText}>오디오 로그</Text>
             </Pressable>
             <Pressable
               style={styles.menuOption}
@@ -317,6 +396,15 @@ function App() {
                 setSettingsVisible(true);
               }}>
               <Text style={styles.menuOptionText}>설정</Text>
+            </Pressable>
+            <Pressable
+              style={styles.menuOption}
+              onPress={() => {
+                setMenuVisible(false);
+                setPromptDraft(customPrompt);
+                setPersonalizationVisible(true);
+              }}>
+              <Text style={styles.menuOptionText}>개인화 설정</Text>
             </Pressable>
             <Pressable
               style={styles.menuCloseButton}
@@ -352,6 +440,87 @@ function App() {
         </View>
       </Modal>
 
+      <Modal visible={personalizationVisible} animationType="slide">
+        <SafeAreaView style={styles.logsScreen}>
+          <View style={styles.logsHeader}>
+            <View>
+              <Text style={styles.logsTitle}>개인화 설정</Text>
+              <Text style={styles.logsSubtitle}>Gemma 판단 프롬프트</Text>
+            </View>
+            <Pressable
+              style={styles.closeButton}
+              onPress={() => setPersonalizationVisible(false)}>
+              <Text style={styles.closeButtonText}>닫기</Text>
+            </Pressable>
+          </View>
+          <ScrollView contentContainerStyle={styles.logsContent}>
+            <Text style={styles.settingDescription}>
+              이 프롬프트는 기본 위급 상황 판단 프롬프트 뒤에 추가되며, 기본 지침보다 우선 적용됩니다.
+            </Text>
+            <TextInput
+              style={styles.promptInput}
+              value={promptDraft}
+              onChangeText={setPromptDraft}
+              multiline
+              textAlignVertical="top"
+              placeholder="Gemma에게 추가로 지시할 내용을 입력하세요."
+            />
+            <Pressable style={styles.secondaryButton} onPress={restoreDefaultPrompt}>
+              <Text style={styles.secondaryButtonText}>기본값으로 원복</Text>
+            </Pressable>
+            <Pressable style={styles.button} onPress={savePrompt}>
+              <Text style={styles.buttonText}>저장</Text>
+            </Pressable>
+          </ScrollView>
+        </SafeAreaView>
+      </Modal>
+
+      <Modal visible={audioLogsVisible} animationType="slide">
+        <SafeAreaView style={styles.logsScreen}>
+          <View style={styles.logsHeader}>
+            <View>
+              <Text style={styles.logsTitle}>오디오 로그</Text>
+              <Text style={styles.logsSubtitle}>최근 {audioLogs.length}개</Text>
+            </View>
+            <Pressable
+              style={styles.closeButton}
+              onPress={() => {
+                stopAudioLog().catch(() => undefined);
+                setAudioLogsVisible(false);
+              }}>
+              <Text style={styles.closeButtonText}>닫기</Text>
+            </Pressable>
+          </View>
+          <ScrollView contentContainerStyle={styles.logsContent}>
+            {audioLogs.length === 0 ? (
+              <Text style={styles.emptyLogs}>아직 저장된 오디오 로그가 없습니다.</Text>
+            ) : (
+              audioLogs.map((log, index) => (
+                <View key={log.id} style={styles.logCard}>
+                  <Text style={styles.logIndex}>#{index + 1}</Text>
+                  <LogRow label="time" value={formatAudioLogTime(log.createdAt)} />
+                  <LogRow label="trigger_source" value={log.trigger_source} />
+                  <LogRow
+                    label="duration_seconds"
+                    value={log.duration_seconds.toFixed(1)}
+                  />
+                  <LogRow label="sample_rate" value={String(log.sample_rate)} />
+                  <Pressable
+                    style={styles.secondaryButton}
+                    onPress={() => playAudioLog(log.id)}>
+                    <Text style={styles.secondaryButtonText}>
+                      {playingAudioId === log.id ? '다시 재생' : '재생'}
+                    </Text>
+                  </Pressable>
+                </View>
+              ))
+            )}
+            <Pressable style={styles.secondaryButton} onPress={stopAudioLog}>
+              <Text style={styles.secondaryButtonText}>재생 중지</Text>
+            </Pressable>
+          </ScrollView>
+        </SafeAreaView>
+      </Modal>
       <Modal visible={logsVisible} animationType="slide">
         <SafeAreaView style={styles.logsScreen}>
           <View style={styles.logsHeader}>
@@ -443,6 +612,12 @@ function formatLocation(location?: {latitude: number; longitude: number}) {
   return `lat ${location.latitude}, lng ${location.longitude}`;
 }
 
+function formatAudioLogTime(value: string | number) {
+  if (typeof value === 'number') {
+    return new Date(value).toLocaleString();
+  }
+  return value;
+}
 async function requestAndroidPermissions() {
   if (Platform.OS !== 'android') {
     return;
@@ -701,6 +876,16 @@ const styles = StyleSheet.create({
     color: '#6b7280',
     fontSize: 12,
     lineHeight: 18,
+  },  promptInput: {
+    minHeight: 260,
+    backgroundColor: '#ffffff',
+    borderColor: '#d1d5db',
+    borderWidth: 1,
+    borderRadius: 8,
+    padding: 14,
+    color: '#111827',
+    fontSize: 14,
+    lineHeight: 20,
   },
   logsScreen: {
     flex: 1,
@@ -780,4 +965,15 @@ const styles = StyleSheet.create({
 });
 
 export default App;
+
+
+
+
+
+
+
+
+
+
+
 

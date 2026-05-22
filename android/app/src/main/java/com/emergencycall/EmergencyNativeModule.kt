@@ -46,7 +46,11 @@ class EmergencyNativeModule(
       )
       putExtra(
         EmergencyForegroundService.EXTRA_STT_ENABLED,
-        if (config.hasKey("sttEnabled")) config.getBoolean("sttEnabled") else true,
+        if (config.hasKey("sttEnabled")) config.getBoolean("sttEnabled") else false,
+      )
+      putExtra(
+        EmergencyForegroundService.EXTRA_CUSTOM_PROMPT,
+        if (config.hasKey("customPrompt")) config.getString("customPrompt") ?: "" else "",
       )
     }
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -104,6 +108,31 @@ class EmergencyNativeModule(
     promise.resolve(true)
   }
 
+  @ReactMethod
+  fun loadAppSettings(promise: Promise) {
+    promise.resolve(preferences.getString("app_settings", """{"sttEnabled":false,"customPrompt":""}"""))
+  }
+
+  @ReactMethod
+  fun saveAppSettings(settingsJson: String, promise: Promise) {
+    preferences.edit().putString("app_settings", settingsJson).apply()
+    promise.resolve(true)
+  }
+
+  @ReactMethod
+  fun loadAudioLogs(promise: Promise) {
+    promise.resolve(AudioLogStore.load(reactContext))
+  }
+
+  @ReactMethod
+  fun playAudioLog(id: String, promise: Promise) {
+    promise.resolve(AudioLogStore.play(reactContext, id))
+  }
+
+  @ReactMethod
+  fun stopAudioLog(promise: Promise) {
+    promise.resolve(AudioLogStore.stop())
+  }
   @ReactMethod
   fun sendEmergencySms(payload: ReadableMap, promise: Promise) {
     if (ContextCompat.checkSelfPermission(reactContext, Manifest.permission.SEND_SMS) != PackageManager.PERMISSION_GRANTED) {
@@ -163,5 +192,10 @@ class EmergencyNativeModule(
       putInt("parts", parts)
     }
 }
+
+
+
+
+
 
 
