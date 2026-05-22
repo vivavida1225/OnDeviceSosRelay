@@ -29,10 +29,11 @@ import {
   initialEmergencyState,
 } from './src/state/emergencyState';
 
+const DEFAULT_AUDIO_RMS_THRESHOLD = 0.35;
+
 const baseMonitoringConfig = {
   modelId: 'gemma-4-E4B-it',
   sensorThreshold: 28,
-  audioRmsThreshold: 0.35,
 };
 
 const DEFAULT_CUSTOM_PROMPT = `기본 프롬프트를 사용합니다.
@@ -42,6 +43,7 @@ const DEFAULT_CUSTOM_PROMPT = `기본 프롬프트를 사용합니다.
 const defaultAppSettings: AppSettings = {
   sttEnabled: false,
   customPrompt: DEFAULT_CUSTOM_PROMPT,
+  audioRmsThreshold: DEFAULT_AUDIO_RMS_THRESHOLD,
 };
 type AnalysisLogEntry = EmergencyAnalysis & {
   id: string;
@@ -65,6 +67,12 @@ function App() {
   const [sttEnabled, setSttEnabled] = useState(defaultAppSettings.sttEnabled);
   const [customPrompt, setCustomPrompt] = useState(defaultAppSettings.customPrompt);
   const [promptDraft, setPromptDraft] = useState(defaultAppSettings.customPrompt);
+  const [audioRmsThreshold, setAudioRmsThreshold] = useState(
+    defaultAppSettings.audioRmsThreshold,
+  );
+  const [audioRmsThresholdInput, setAudioRmsThresholdInput] = useState(
+    String(defaultAppSettings.audioRmsThreshold),
+  );
   const smsSentForAnalysis = useRef<EmergencyAnalysis | undefined>(undefined);
 
   useEffect(() => {
@@ -88,10 +96,14 @@ function App() {
           ...parsed,
           sttEnabled: parsed.sttEnabled ?? defaultAppSettings.sttEnabled,
           customPrompt: parsed.customPrompt || defaultAppSettings.customPrompt,
+          audioRmsThreshold:
+            parsed.audioRmsThreshold ?? defaultAppSettings.audioRmsThreshold,
         };
         setSttEnabled(nextSettings.sttEnabled);
         setCustomPrompt(nextSettings.customPrompt);
         setPromptDraft(nextSettings.customPrompt);
+        setAudioRmsThreshold(nextSettings.audioRmsThreshold);
+        setAudioRmsThresholdInput(String(nextSettings.audioRmsThreshold));
       })
       .catch(error => {
         console.warn('[EmergencyDebug] loadAppSettings failed', error);
@@ -152,7 +164,7 @@ function App() {
       }),
     ];
 
-    return () => subscriptions.forEach(subscription => subscription.remove());
+  return () => subscriptions.forEach(subscription => subscription.remove());
   }, []);
 
   useEffect(() => {
@@ -202,7 +214,7 @@ function App() {
     try {
       const logsJson = await EmergencyNative.loadAudioLogs();
       const logs = JSON.parse(logsJson);
-      setAudioLogs(Array.isArray(logs) ? logs.slice(0, 3) : []);
+      setAudioLogs(Array.isArray(logs) ? logs.slice(0, 5) : []);
     } catch (error) {
       console.warn('[EmergencyDebug] loadAudioLogs failed', error);
       setAudioLogs([]);
@@ -228,9 +240,9 @@ function App() {
   const savePrompt = useCallback(async () => {
     const nextPrompt = promptDraft.trim() || defaultAppSettings.customPrompt;
     setCustomPrompt(nextPrompt);
-    await saveSettings({sttEnabled, customPrompt: nextPrompt});
+    await saveSettings({sttEnabled, customPrompt: nextPrompt, audioRmsThreshold});
     setPersonalizationVisible(false);
-  }, [promptDraft, saveSettings, sttEnabled]);
+  }, [audioRmsThreshold, promptDraft, saveSettings, sttEnabled]);
 
   const restoreDefaultPrompt = useCallback(() => {
     setPromptDraft(defaultAppSettings.customPrompt);
@@ -239,7 +251,12 @@ function App() {
     try {
       dispatch({type: 'START_REQUESTED'});
       await requestAndroidPermissions();
-      const config = {...baseMonitoringConfig, sttEnabled, customPrompt};
+      const config = {
+        ...baseMonitoringConfig,
+        audioRmsThreshold,
+        sttEnabled,
+        customPrompt,
+      };
       const warmUpStatus = await MlcGemmaNative.warmUp(config.modelId);
       console.log('[EmergencyDebug] warmUp', warmUpStatus);
       await EmergencyNative.startMonitoring(config);
@@ -249,7 +266,7 @@ function App() {
         message: error instanceof Error ? error.message : '시작 실패',
       });
     }
-  }, [customPrompt, sttEnabled]);
+  }, [audioRmsThreshold, customPrompt, sttEnabled]);
 
   const stopMonitoring = useCallback(async () => {
     await EmergencyNative.stopMonitoring();
@@ -290,7 +307,7 @@ function App() {
   const updateSttEnabled = useCallback(
     async (enabled: boolean) => {
       setSttEnabled(enabled);
-      await saveSettings({sttEnabled: enabled, customPrompt});
+      await saveSettings({sttEnabled: enabled, customPrompt, audioRmsThreshold});
       if (!isMonitoring) {
         return;
       }
@@ -298,6 +315,7 @@ function App() {
       try {
         await EmergencyNative.startMonitoring({
           ...baseMonitoringConfig,
+          audioRmsThreshold,
           sttEnabled: enabled,
           customPrompt,
         });
@@ -305,8 +323,47 @@ function App() {
         console.warn('[EmergencyDebug] updateSttEnabled failed', error);
       }
     },
-    [customPrompt, isMonitoring, saveSettings],
+    [audioRmsThreshold, customPrompt, isMonitoring, saveSettings],
   );
+  const updateAudioRmsThreshold = useCallback(async () => {
+    const parsed = Number(audioRmsThresholdInput);
+    if (!Number.isFinite(parsed) || parsed <= 0 || parsed > 1) {
+      Alert.alert('임계값 오류', '0보다 크고 1 이하인 숫자를 입력해 주세요.');
+      setAudioRmsThresholdInput(String(audioRmsThreshold));
+      return;
+    }
+
+    const nextThreshold = Number(parsed.toFixed(3));
+    setAudioRmsThreshold(nextThreshold);
+    setAudioRmsThresholdInput(String(nextThreshold));
+    await saveSettings({
+      sttEnabled,
+      customPrompt,
+      audioRmsThreshold: nextThreshold,
+    });
+
+    if (!isMonitoring) {
+      return;
+    }
+
+    try {
+      await EmergencyNative.startMonitoring({
+        ...baseMonitoringConfig,
+        audioRmsThreshold: nextThreshold,
+        sttEnabled,
+        customPrompt,
+      });
+    } catch (error) {
+      console.warn('[EmergencyDebug] updateAudioRmsThreshold failed', error);
+    }
+  }, [
+    audioRmsThreshold,
+    audioRmsThresholdInput,
+    customPrompt,
+    isMonitoring,
+    saveSettings,
+    sttEnabled,
+  ]);
   return (
     <SafeAreaView style={styles.safeArea}>
       <StatusBar barStyle={isDarkMode ? 'light-content' : 'dark-content'} />
@@ -480,7 +537,7 @@ function App() {
           <View style={styles.logsHeader}>
             <View>
               <Text style={styles.logsTitle}>오디오 로그</Text>
-              <Text style={styles.logsSubtitle}>최근 {audioLogs.length}개</Text>
+              <Text style={styles.logsSubtitle}>최근 {audioLogs.length}개 / 최대 5개</Text>
             </View>
             <Pressable
               style={styles.closeButton}
@@ -492,6 +549,26 @@ function App() {
             </Pressable>
           </View>
           <ScrollView contentContainerStyle={styles.logsContent}>
+            <View style={styles.thresholdPanel}>
+              <Text style={styles.settingLabel}>오디오 트리거 RMS 임계값</Text>
+              <Text style={styles.settingDescription}>
+                현재 값: {audioRmsThreshold.toFixed(3)}. 값이 낮을수록 작은 소리에도 트리거가 켜집니다.
+              </Text>
+              <View style={styles.thresholdControls}>
+                <TextInput
+                  style={styles.thresholdInput}
+                  value={audioRmsThresholdInput}
+                  onChangeText={setAudioRmsThresholdInput}
+                  keyboardType="decimal-pad"
+                  placeholder="0.35"
+                />
+                <Pressable
+                  style={styles.thresholdApplyButton}
+                  onPress={updateAudioRmsThreshold}>
+                  <Text style={styles.buttonText}>적용</Text>
+                </Pressable>
+              </View>
+            </View>
             {audioLogs.length === 0 ? (
               <Text style={styles.emptyLogs}>아직 저장된 오디오 로그가 없습니다.</Text>
             ) : (
@@ -505,6 +582,10 @@ function App() {
                     value={log.duration_seconds.toFixed(1)}
                   />
                   <LogRow label="sample_rate" value={String(log.sample_rate)} />
+                  <LogRow
+                    label="max_rms"
+                    value={formatOptionalNumber(log.max_rms)}
+                  />
                   <Pressable
                     style={styles.secondaryButton}
                     onPress={() => playAudioLog(log.id)}>
@@ -612,6 +693,12 @@ function formatLocation(location?: {latitude: number; longitude: number}) {
   return `lat ${location.latitude}, lng ${location.longitude}`;
 }
 
+function formatOptionalNumber(value?: number) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return undefined;
+  }
+  return value.toFixed(4);
+}
 function formatAudioLogTime(value: string | number) {
   if (typeof value === 'number') {
     return new Date(value).toLocaleString();
@@ -876,7 +963,40 @@ const styles = StyleSheet.create({
     color: '#6b7280',
     fontSize: 12,
     lineHeight: 18,
-  },  promptInput: {
+  },
+  thresholdPanel: {
+    backgroundColor: '#ffffff',
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    padding: 14,
+    gap: 10,
+  },
+  thresholdControls: {
+    flexDirection: 'row',
+    gap: 10,
+  },
+  thresholdInput: {
+    flex: 1,
+    minHeight: 48,
+    backgroundColor: '#ffffff',
+    borderColor: '#d1d5db',
+    borderWidth: 1,
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    color: '#111827',
+    fontSize: 15,
+    fontWeight: '800',
+  },
+  thresholdApplyButton: {
+    minHeight: 48,
+    minWidth: 86,
+    backgroundColor: '#111827',
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  promptInput: {
     minHeight: 260,
     backgroundColor: '#ffffff',
     borderColor: '#d1d5db',
@@ -965,6 +1085,13 @@ const styles = StyleSheet.create({
 });
 
 export default App;
+
+
+
+
+
+
+
 
 
 

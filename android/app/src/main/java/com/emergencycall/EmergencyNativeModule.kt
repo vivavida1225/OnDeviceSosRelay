@@ -110,7 +110,7 @@ class EmergencyNativeModule(
 
   @ReactMethod
   fun loadAppSettings(promise: Promise) {
-    promise.resolve(preferences.getString("app_settings", """{"sttEnabled":false,"customPrompt":""}"""))
+    promise.resolve(preferences.getString("app_settings", """{"sttEnabled":false,"customPrompt":"","audioRmsThreshold":0.35}"""))
   }
 
   @ReactMethod
@@ -192,6 +192,7 @@ class EmergencyNativeModule(
       putInt("parts", parts)
     }
 }
+
 
 
 

@@ -32,6 +32,7 @@ export type MonitoringConfig = {
 export type AppSettings = {
   sttEnabled: boolean;
   customPrompt: string;
+  audioRmsThreshold: number;
 };
 
 export type AudioLogEntry = {
@@ -41,6 +42,7 @@ export type AudioLogEntry = {
   duration_seconds: number;
   sample_rate: number;
   file_name: string;
+  max_rms?: number;
 };
 
 type EmergencyNativeModule = {
@@ -115,6 +117,7 @@ export const emergencyEvents =
   Platform.OS === 'android' && NativeModules.EmergencyNative
     ? new NativeEventEmitter(NativeModules.EmergencyNative)
     : undefined;
+
 
 
 

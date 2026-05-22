@@ -241,6 +241,7 @@ class EmergencyForegroundService : Service(), SensorEventListener {
           triggerSource = source,
           sentStartOffsetMs = audioSnapshot.sentStartOffsetMs,
           sentEndOffsetMs = audioSnapshot.sentEndOffsetMs,
+          maxRms = audioSnapshot.maxRms,
         )
       }.getOrNull()
       audioLog?.let {
@@ -251,6 +252,7 @@ class EmergencyForegroundService : Service(), SensorEventListener {
             putString("audio_log_id", it.optString("id"))
             putString("trigger_source", source)
             putDouble("duration_seconds", it.optDouble("duration_seconds"))
+            putDouble("max_rms", it.optDouble("max_rms"))
           },
         )
       }
@@ -441,6 +443,7 @@ class EmergencyForegroundService : Service(), SensorEventListener {
       rmsFullBuffer = rms(snapshot, snapshot.size),
       rmsLastOneSecond = rms(snapshot, minOf(sampleRate, snapshot.size), maxOf(0, snapshot.size - sampleRate)),
       peakFullBuffer = peak(snapshot, snapshot.size),
+      maxRms = maxWindowRms(snapshot),
       firstNonSilentOffsetMs = nonSilentOffsetMs(firstNonSilentIndex),
       lastNonSilentOffsetMs = nonSilentOffsetMs(lastNonSilentIndex),
       lastAudioReadAgeMs = if (lastAudioReadAtMs == 0L) -1 else (SystemClock.elapsedRealtime() - lastAudioReadAtMs).toInt(),
@@ -455,6 +458,19 @@ class EmergencyForegroundService : Service(), SensorEventListener {
       sum += normalized * normalized
     }
     return sqrt(sum / read)
+  }
+
+  private fun maxWindowRms(buffer: ShortArray): Double {
+    if (buffer.isEmpty()) return 0.0
+    val windowSize = minOf(sampleRate / 4, buffer.size)
+    var maxRms = 0.0
+    var start = 0
+    while (start < buffer.size) {
+      val read = minOf(windowSize, buffer.size - start)
+      maxRms = maxOf(maxRms, rms(buffer, read, start))
+      start += windowSize
+    }
+    return maxRms
   }
 
   private fun peak(buffer: ShortArray, read: Int): Double {
@@ -561,10 +577,14 @@ private data class AudioSnapshot(
   val rmsFullBuffer: Double,
   val rmsLastOneSecond: Double,
   val peakFullBuffer: Double,
+  val maxRms: Double,
   val firstNonSilentOffsetMs: Int,
   val lastNonSilentOffsetMs: Int,
   val lastAudioReadAgeMs: Int,
 )
+
+
+
 
 
 
