@@ -12,7 +12,7 @@ object AudioLogStore {
   private const val PREF_NAME = "onguard_ai_prefs"
   private const val PREF_KEY = "audio_logs"
   private const val AUDIO_DIR = "audio_logs"
-  private const val MAX_LOGS = 5
+  private const val MAX_LOGS = 10
   private var mediaPlayer: MediaPlayer? = null
 
   @Synchronized
@@ -24,6 +24,7 @@ object AudioLogStore {
     sentStartOffsetMs: Int,
     sentEndOffsetMs: Int,
     maxRms: Double,
+    analysisPass: String,
   ): JSONObject {
     val pcmBytes = Base64.decode(pcmBase64, Base64.NO_WRAP)
     val wavBytes = WavPcm.pcm16Base64ToWavBytes(pcmBytes, sampleRate)
@@ -38,6 +39,7 @@ object AudioLogStore {
       put("id", id)
       put("createdAt", now)
       put("trigger_source", triggerSource)
+      put("analysis_pass", analysisPass)
       put("duration_seconds", durationSeconds)
       put("sample_rate", sampleRate)
       put("file_name", file.name)
@@ -109,6 +111,8 @@ object AudioLogStore {
       .apply()
   }
 }
+
+
 
 
 

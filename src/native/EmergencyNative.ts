@@ -1,8 +1,16 @@
-﻿import {NativeEventEmitter, NativeModules, Platform} from 'react-native';
+import {NativeEventEmitter, NativeModules, Platform} from 'react-native';
 
 export type EmergencyLocation = {
   latitude: number;
   longitude: number;
+};
+
+export type SttEngine = 'off' | 'sherpa-onnx-moonshine-tiny-ko-quantized-2026-02-27';
+
+export type GemmaPromptTemplates = {
+  system: string;
+  primary: string;
+  secondary: string;
 };
 
 export type EmergencyAnalysis = {
@@ -15,6 +23,13 @@ export type EmergencyAnalysis = {
   analysis_mode?: string;
   litert_error?: string;
   recognized_dialogue?: string;
+  confidence?: string;
+  analysis_pass?: string;
+  final_decision?: boolean;
+  audio_summary?: string;
+  stt_context_used?: boolean;
+  previous_primary_context?: string;
+  decision_reason?: string;
   stt_transcript?: string;
   stt_engine?: string;
   stt_error?: string;
@@ -26,11 +41,12 @@ export type MonitoringConfig = {
   sensorThreshold: number;
   audioRmsThreshold: number;
   sttEnabled: boolean;
+  sttEngine: SttEngine;
   customPrompt?: string;
 };
 
 export type AppSettings = {
-  sttEnabled: boolean;
+  sttEngine: SttEngine;
   customPrompt: string;
   audioRmsThreshold: number;
 };
@@ -43,6 +59,7 @@ export type AudioLogEntry = {
   sample_rate: number;
   file_name: string;
   max_rms?: number;
+  analysis_pass?: string;
 };
 
 type EmergencyNativeModule = {
@@ -56,6 +73,9 @@ type EmergencyNativeModule = {
   saveAnalysisLogs(logsJson: string): Promise<boolean>;
   loadAppSettings(): Promise<string>;
   saveAppSettings(settingsJson: string): Promise<boolean>;
+  loadGemmaPrompts(): Promise<string>;
+  saveGemmaPrompts(promptsJson: string): Promise<boolean>;
+  resetGemmaPrompts(): Promise<string>;
   loadAudioLogs(): Promise<string>;
   playAudioLog(id: string): Promise<boolean>;
   stopAudioLog(): Promise<boolean>;
@@ -99,6 +119,9 @@ export const EmergencyNative: EmergencyNativeModule =
         saveAnalysisLogs: () => missingModule('EmergencyNative'),
         loadAppSettings: () => missingModule('EmergencyNative'),
         saveAppSettings: () => missingModule('EmergencyNative'),
+        loadGemmaPrompts: () => missingModule('EmergencyNative'),
+        saveGemmaPrompts: () => missingModule('EmergencyNative'),
+        resetGemmaPrompts: () => missingModule('EmergencyNative'),
         loadAudioLogs: () => missingModule('EmergencyNative'),
         playAudioLog: () => missingModule('EmergencyNative'),
         stopAudioLog: () => missingModule('EmergencyNative'),
@@ -117,8 +140,5 @@ export const emergencyEvents =
   Platform.OS === 'android' && NativeModules.EmergencyNative
     ? new NativeEventEmitter(NativeModules.EmergencyNative)
     : undefined;
-
-
-
 
 

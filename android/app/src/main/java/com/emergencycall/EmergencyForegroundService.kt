@@ -1,4 +1,4 @@
-﻿package com.emergencycall
+package com.emergencycall
 
 import android.Manifest
 import android.app.Notification
@@ -40,7 +40,7 @@ class EmergencyForegroundService : Service(), SensorEventListener {
   private var ringWriteIndex = 0
   private var sensorThreshold = 28.0
   private var audioRmsThreshold = 0.35
-  private var sttEnabled = false
+  private var sttEngine = SherpaOnnxMoonshineSttAnalyzer.ENGINE_OFF
   private var customPrompt = ""
   private var lastReadSize = 0
   private var lastReadRms = 0.0
@@ -95,9 +95,10 @@ class EmergencyForegroundService : Service(), SensorEventListener {
   private fun startMonitoring(intent: Intent) {
     sensorThreshold = intent.getDoubleExtra(EXTRA_SENSOR_THRESHOLD, 28.0)
     audioRmsThreshold = intent.getDoubleExtra(EXTRA_AUDIO_RMS_THRESHOLD, 0.35)
-    sttEnabled = intent.getBooleanExtra(EXTRA_STT_ENABLED, false)
+    sttEngine = intent.getStringExtra(EXTRA_STT_ENGINE)
+      ?: if (intent.getBooleanExtra(EXTRA_STT_ENABLED, false)) SherpaOnnxMoonshineSttAnalyzer.ENGINE_MOONSHINE_TINY_KO else SherpaOnnxMoonshineSttAnalyzer.ENGINE_OFF
     customPrompt = intent.getStringExtra(EXTRA_CUSTOM_PROMPT) ?: ""
-    Log.i(TAG, "startMonitoring: sttEnabled=$sttEnabled")
+    Log.i(TAG, "startMonitoring: sttEngine=$sttEngine")
     val modelId = intent.getStringExtra(EXTRA_MODEL_ID) ?: "gemma-4-E4B-it"
     Log.i(TAG, "startMonitoring: warmUp requested modelId=$modelId monitoring=$monitoring")
     val warmUpResult = LiteRtGemmaAnalyzer.warmUp(this, modelId)
@@ -211,7 +212,7 @@ class EmergencyForegroundService : Service(), SensorEventListener {
 
     val triggerEvent = Arguments.createMap()
     triggerEvent.putString("source", source)
-    triggerEvent.putInt("post_capture_ms", postCaptureMs)
+    triggerEvent.putInt("post_capture_ms", SECONDARY_POST_CAPTURE_MS)
     EmergencyEventBus.emit("triggerDetected", triggerEvent)
 
     val status = Arguments.createMap()
@@ -219,169 +220,303 @@ class EmergencyForegroundService : Service(), SensorEventListener {
     EmergencyEventBus.emit("serviceStatus", status)
 
     thread(name = "EmergencyAnalysis") {
-      if (postCaptureMs > 0) {
-        emitAnalysisDebug(
-          "post_capture_wait_started",
-          Arguments.createMap().apply {
-            putString("message", "트리거 후 추가 녹음 시작")
-            putString("trigger_source", source)
-            putInt("post_capture_ms", postCaptureMs)
-          },
-        )
-        SystemClock.sleep(postCaptureMs.toLong())
-      }
-
       val location = currentLocation()
-      val audioSnapshot = readRingBufferSnapshot()
-      val audioLog = runCatching {
-        AudioLogStore.save(
-          context = this,
-          pcmBase64 = audioSnapshot.fullBase64,
-          sampleRate = sampleRate,
-          triggerSource = source,
-          sentStartOffsetMs = audioSnapshot.sentStartOffsetMs,
-          sentEndOffsetMs = audioSnapshot.sentEndOffsetMs,
-          maxRms = audioSnapshot.maxRms,
-        )
-      }.getOrNull()
-      audioLog?.let {
+      val primarySnapshot = readRingBufferSnapshot()
+      saveAudioLog(source, PRIMARY_ANALYSIS_PASS, primarySnapshot)?.let {
+        emitAudioLogSaved("1차 추론 오디오 로그 저장 완료", source, PRIMARY_ANALYSIS_PASS, it)
+      }
+
+      emitAnalysisDebug(
+        "primary_audio_captured",
+        Arguments.createMap().apply {
+          putString("message", "1차 추론용 트리거 직전 음성 추출 완료")
+          putString("trigger_source", source)
+          putString("analysis_pass", PRIMARY_ANALYSIS_PASS)
+          putString("analysis_audio_role", "primary_pre_trigger")
+          putAudioSnapshotFields(primarySnapshot, location, 0)
+        },
+      )
+
+      var postTriggerSnapshot: AudioSnapshot? = null
+      val postCaptureThread = thread(name = "EmergencyPostCapture") {
         emitAnalysisDebug(
-          "audio_log_saved",
+          "secondary_capture_started",
           Arguments.createMap().apply {
-            putString("message", "오디오 로그 저장 완료")
-            putString("audio_log_id", it.optString("id"))
+            putString("message", "2차 추론용 트리거 이후 7초 녹음 시작")
             putString("trigger_source", source)
-            putDouble("duration_seconds", it.optDouble("duration_seconds"))
-            putDouble("max_rms", it.optDouble("max_rms"))
+            putString("analysis_pass", SECONDARY_ANALYSIS_PASS)
+            putInt("post_capture_ms", SECONDARY_POST_CAPTURE_MS)
           },
         )
-      }
-
-      emitAnalysisDebug(
-        "audio_extracted",
-        Arguments.createMap().apply {
-          putString("message", "음성 추출 완료")
-          putString("trigger_source", source)
-          putInt("sample_rate", sampleRate)
-          putInt("audio_seconds", ringBuffer.size / sampleRate)
-          putDouble("captured_audio_seconds", audioSnapshot.sampleCount.toDouble() / sampleRate)
-          putDouble("buffer_filled_ratio", audioSnapshot.sampleCount.toDouble() / ringBuffer.size)
-          putInt("pcm_bytes", ringBuffer.size * 2)
-          putInt("sent_pcm_bytes", audioSnapshot.pcmBytes)
-          putDouble("sent_audio_seconds", audioSnapshot.sentSampleCount.toDouble() / sampleRate)
-          putInt("sent_start_offset_ms", audioSnapshot.sentStartOffsetMs)
-          putInt("sent_end_offset_ms", audioSnapshot.sentEndOffsetMs)
-          putInt("base64_length", audioSnapshot.base64.length)
-          putInt("recording_state", audioRecord?.recordingState ?: -1)
-          putInt("audio_record_state", audioRecord?.state ?: -1)
-          putInt("last_read_size", lastReadSize)
-          putDouble("last_read_rms", lastReadRms)
-          putDouble("last_read_peak", lastReadPeak)
-          putInt("last_audio_read_age_ms", audioSnapshot.lastAudioReadAgeMs)
-          putDouble("total_read_seconds", totalReadSamples.toDouble() / sampleRate)
-          putInt("ring_write_index", audioSnapshot.ringWriteIndex)
-          putInt("sent_sample_count", audioSnapshot.sentSampleCount)
-          putInt("non_zero_samples", audioSnapshot.nonZeroSamples)
-          putInt("non_silent_samples", audioSnapshot.nonSilentSamples)
-          putInt("non_silent_threshold", AUDIO_NON_SILENT_THRESHOLD)
-          putDouble("rms_full_buffer", audioSnapshot.rmsFullBuffer)
-          putDouble("rms_last_1s", audioSnapshot.rmsLastOneSecond)
-          putDouble("peak_full_buffer", audioSnapshot.peakFullBuffer)
-          putInt("first_non_silent_offset_ms", audioSnapshot.firstNonSilentOffsetMs)
-          putInt("last_non_silent_offset_ms", audioSnapshot.lastNonSilentOffsetMs)
-          putInt("post_capture_ms", postCaptureMs)
-          putBoolean("has_location", location != null)
-          location?.let {
-            putMap("location", Arguments.createMap().apply {
-              putDouble("latitude", it.latitude)
-              putDouble("longitude", it.longitude)
-            })
-          }
-        },
-      )
-
-      emitAnalysisDebug(
-        "stt_call_started",
-        Arguments.createMap().apply {
-          putString("message", "STT 호출 시작")
-          putString("trigger_source", source)
-          putString("stt_engine", "sherpa-onnx-whisper-tiny-int8")
-        },
-      )
-
-      val sttResult = if (sttEnabled) {
-        Log.i(TAG, "stt_transcribe_call_enter source=$source")
-        SherpaOnnxWhisperSttAnalyzer.transcribe(this, audioSnapshot.base64, sampleRate).also {
-          Log.i(TAG, "stt_transcribe_call_return transcriptLength=${it.transcript.length} error=${it.error}")
+        SystemClock.sleep(SECONDARY_POST_CAPTURE_MS.toLong())
+        postTriggerSnapshot = readRingBufferSnapshot((sampleRate * SECONDARY_POST_CAPTURE_MS) / 1000).also { snapshot ->
+          emitAnalysisDebug(
+            "secondary_audio_captured",
+            Arguments.createMap().apply {
+              putString("message", "2차 추론용 트리거 이후 음성 추출 완료")
+              putString("trigger_source", source)
+              putString("analysis_pass", SECONDARY_ANALYSIS_PASS)
+              putString("analysis_audio_role", "secondary_post_trigger")
+              putInt("post_capture_ms", SECONDARY_POST_CAPTURE_MS)
+              putAudioSnapshotFields(snapshot, location, SECONDARY_POST_CAPTURE_MS)
+            },
+          )
         }
-      } else {
-        Log.i(TAG, "stt_transcribe_skipped source=$source")
-        SttResult(transcript = "", engine = "disabled", error = null, elapsedMs = 0)
       }
+
       emitAnalysisDebug(
-        if (sttEnabled) "stt_call_completed" else "stt_call_skipped",
+        "primary_ai_started",
         Arguments.createMap().apply {
-          putString("message", if (sttEnabled) "STT 호출 완료" else "STT 비활성화로 호출 생략")
+          putString("message", "1차 추론 시작")
           putString("trigger_source", source)
-          putString("stt_engine", sttResult.engine)
-          putString("stt_transcript", sttResult.transcript)
-          putInt("stt_elapsed_ms", sttResult.elapsedMs)
-          putBoolean("stt_enabled", sttEnabled)
+          putString("analysis_pass", PRIMARY_ANALYSIS_PASS)
+          putBoolean("stt_context_used", false)
+        },
+      )
+
+      val primaryStartedAt = SystemClock.elapsedRealtime()
+      val primaryResult = LiteRtGemmaAnalyzer.analyze(
+        context = this,
+        pcmBase64 = primarySnapshot.base64,
+        sampleRate = sampleRate,
+        location = location,
+        triggerSource = source,
+        sttTranscript = "",
+        customPrompt = customPrompt,
+        analysisPass = PRIMARY_ANALYSIS_PASS,
+        previousContext = "",
+      )
+      val primaryEmergency = primaryResult.getBoolean("is_emergency")
+      decorateAnalysisResult(primaryResult, PRIMARY_ANALYSIS_PASS, finalDecision = primaryEmergency, sttResult = null)
+      val primaryElapsedMs = (SystemClock.elapsedRealtime() - primaryStartedAt).toInt()
+      emitAiCompletedDebug("primary_ai_completed", "1차 추론 완료", source, PRIMARY_ANALYSIS_PASS, primaryResult, primaryElapsedMs, primaryEmergency)
+      EmergencyEventBus.emit("analysisLog", cloneAnalysisResult(primaryResult))
+
+      if (primaryEmergency) {
+        EmergencyEventBus.emit("analysisResult", cloneAnalysisResult(primaryResult))
+        return@thread
+      }
+
+      postCaptureThread.join()
+      val secondarySnapshot = postTriggerSnapshot ?: readRingBufferSnapshot((sampleRate * SECONDARY_POST_CAPTURE_MS) / 1000)
+      saveAudioLog(source, SECONDARY_ANALYSIS_PASS, secondarySnapshot)?.let {
+        emitAudioLogSaved("2차 추론 오디오 로그 저장 완료", source, SECONDARY_ANALYSIS_PASS, it)
+      }
+
+      val sttResult = runExperimentalStt(source, secondarySnapshot)
+      val primaryContext = summarizePrimaryContext(primaryResult)
+      emitAnalysisDebug(
+        "secondary_ai_started",
+        Arguments.createMap().apply {
+          putString("message", "2차 추론 시작")
+          putString("trigger_source", source)
+          putString("analysis_pass", SECONDARY_ANALYSIS_PASS)
+          putString("previous_primary_context", primaryContext)
+          putBoolean("stt_context_used", false)
           sttResult.error?.let { putString("stt_error", it) }
         },
       )
 
-      emitAnalysisDebug(
-        "ai_call_started",
-        Arguments.createMap().apply {
-          putString("message", "AI 호출 시작")
-          putString("trigger_source", source)
-          putString("stt_transcript", sttResult.transcript)
-          sttResult.error?.let { putString("stt_error", it) }
-        },
+      val secondaryStartedAt = SystemClock.elapsedRealtime()
+      val secondaryResult = LiteRtGemmaAnalyzer.analyze(
+        context = this,
+        pcmBase64 = secondarySnapshot.base64,
+        sampleRate = sampleRate,
+        location = location,
+        triggerSource = source,
+        sttTranscript = "",
+        customPrompt = customPrompt,
+        analysisPass = SECONDARY_ANALYSIS_PASS,
+        previousContext = primaryContext,
       )
+      decorateAnalysisResult(secondaryResult, SECONDARY_ANALYSIS_PASS, finalDecision = true, sttResult = sttResult)
+      secondaryResult.putString("previous_primary_context", primaryContext)
+      val secondaryElapsedMs = (SystemClock.elapsedRealtime() - secondaryStartedAt).toInt()
+      val secondaryEmergency = secondaryResult.getBoolean("is_emergency")
+      emitAiCompletedDebug("secondary_ai_completed", "2차 추론 완료", source, SECONDARY_ANALYSIS_PASS, secondaryResult, secondaryElapsedMs, true)
+      EmergencyEventBus.emit("analysisLog", cloneAnalysisResult(secondaryResult))
+      EmergencyEventBus.emit("analysisResult", cloneAnalysisResult(secondaryResult))
 
-      val startedAt = SystemClock.elapsedRealtime()
-      val result = LiteRtGemmaAnalyzer.analyze(this, audioSnapshot.base64, sampleRate, location, source, sttResult.transcript, customPrompt)
-      result.putString("stt_transcript", sttResult.transcript)
-      result.putString("stt_engine", sttResult.engine)
-      sttResult.error?.let { result.putString("stt_error", it) }
-      val elapsedMs = (SystemClock.elapsedRealtime() - startedAt).toInt()
-      val isEmergency = result.getBoolean("is_emergency")
-
-      emitAnalysisDebug(
-        "ai_call_completed",
-        Arguments.createMap().apply {
-          putString("message", "AI 호출 완료")
-          putInt("elapsed_ms", elapsedMs)
-          putBoolean("is_emergency", isEmergency)
-          putString("crime_type", result.getString("crime_type"))
-          putString("situation_summary", result.getString("situation_summary"))
-          if (result.hasKey("recognized_dialogue")) {
-            putString("recognized_dialogue", result.getString("recognized_dialogue"))
-          }
-          if (result.hasKey("stt_transcript")) putString("stt_transcript", result.getString("stt_transcript"))
-          if (result.hasKey("stt_engine")) putString("stt_engine", result.getString("stt_engine"))
-          if (result.hasKey("stt_error")) putString("stt_error", result.getString("stt_error"))
-          if (result.hasKey("model_id")) putString("model_id", result.getString("model_id"))
-          if (result.hasKey("analysis_mode")) putString("analysis_mode", result.getString("analysis_mode"))
-          if (result.hasKey("trigger_source")) putString("trigger_source", result.getString("trigger_source"))
-          if (result.hasKey("litert_error")) putString("litert_error", result.getString("litert_error"))
-          if (result.hasKey("raw_model_response")) putString("raw_model_response", result.getString("raw_model_response"))
-        },
-      )
-
-      EmergencyEventBus.emit("analysisResult", result)
-      if (!isEmergency) {
+      if (!secondaryEmergency) {
         triggerLocked = false
         val monitoringStatus = Arguments.createMap()
         monitoringStatus.putString("status", "monitoring")
-        monitoringStatus.putString("reason", "non_emergency_analysis")
+        monitoringStatus.putString("reason", "secondary_non_emergency_analysis")
         EmergencyEventBus.emit("serviceStatus", monitoringStatus)
       }
     }
   }
 
+  private fun saveAudioLog(source: String, analysisPass: String, snapshot: AudioSnapshot): org.json.JSONObject? =
+    runCatching {
+      AudioLogStore.save(
+        context = this,
+        pcmBase64 = snapshot.fullBase64,
+        sampleRate = sampleRate,
+        triggerSource = source,
+        sentStartOffsetMs = snapshot.sentStartOffsetMs,
+        sentEndOffsetMs = snapshot.sentEndOffsetMs,
+        maxRms = snapshot.maxRms,
+        analysisPass = analysisPass,
+      )
+    }.getOrNull()
+
+  private fun emitAudioLogSaved(message: String, source: String, analysisPass: String, audioLog: org.json.JSONObject) {
+    emitAnalysisDebug(
+      "audio_log_saved",
+      Arguments.createMap().apply {
+        putString("message", message)
+        putString("audio_log_id", audioLog.optString("id"))
+        putString("trigger_source", source)
+        putString("analysis_pass", analysisPass)
+        putDouble("duration_seconds", audioLog.optDouble("duration_seconds"))
+        putDouble("max_rms", audioLog.optDouble("max_rms"))
+      },
+    )
+  }
+
+  private fun runExperimentalStt(source: String, snapshot: AudioSnapshot): SttResult {
+    val sttEnabled = sttEngine != SherpaOnnxMoonshineSttAnalyzer.ENGINE_OFF
+    emitAnalysisDebug(
+      "stt_call_started",
+      Arguments.createMap().apply {
+        putString("message", if (sttEnabled) "실험용 STT 호출 시작" else "STT 비활성화로 호출 생략")
+        putString("trigger_source", source)
+        putString("analysis_pass", SECONDARY_ANALYSIS_PASS)
+        putString("stt_engine", sttEngine)
+        putBoolean("stt_enabled", sttEnabled)
+        putBoolean("used_for_gemma_decision", false)
+      },
+    )
+
+    val result = if (sttEnabled) {
+      Log.i(TAG, "stt_transcribe_call_enter source=$source engine=$sttEngine postBytes=${snapshot.pcmBytes}")
+      SherpaOnnxMoonshineSttAnalyzer.transcribe(this, snapshot.base64, sampleRate, sttEngine).also {
+        Log.i(TAG, "stt_transcribe_call_return engine=$sttEngine transcriptLength=${it.transcript.length} error=${it.error}")
+      }
+    } else {
+      Log.i(TAG, "stt_transcribe_skipped source=$source")
+      SttResult(transcript = "", engine = SherpaOnnxMoonshineSttAnalyzer.ENGINE_OFF, error = null, elapsedMs = 0)
+    }
+
+    emitAnalysisDebug(
+      if (sttEnabled) "stt_call_completed" else "stt_call_skipped",
+      Arguments.createMap().apply {
+        putString("message", if (sttEnabled) "실험용 STT 호출 완료" else "STT 비활성화로 호출 생략")
+        putString("trigger_source", source)
+        putString("analysis_pass", SECONDARY_ANALYSIS_PASS)
+        putString("stt_engine", result.engine)
+        putString("stt_transcript", result.transcript)
+        putInt("stt_elapsed_ms", result.elapsedMs)
+        putBoolean("stt_enabled", sttEnabled)
+        putBoolean("used_for_gemma_decision", false)
+        result.error?.let { putString("stt_error", it) }
+      },
+    )
+    return result
+  }
+
+  private fun decorateAnalysisResult(
+    result: WritableMap,
+    analysisPass: String,
+    finalDecision: Boolean,
+    sttResult: SttResult?,
+  ) {
+    result.putString("analysis_pass", analysisPass)
+    result.putBoolean("final_decision", finalDecision)
+    result.putBoolean("stt_context_used", false)
+    result.putString("stt_transcript", sttResult?.transcript ?: "")
+    result.putString("stt_engine", sttResult?.engine ?: SherpaOnnxMoonshineSttAnalyzer.ENGINE_OFF)
+    sttResult?.error?.let { result.putString("stt_error", it) }
+  }
+
+  private fun summarizePrimaryContext(result: WritableMap): String {
+    val emergency = result.getBoolean("is_emergency")
+    val confidence = if (result.hasKey("confidence")) result.getString("confidence") else "unknown"
+    val crimeType = if (result.hasKey("crime_type")) result.getString("crime_type") else "unknown"
+    val dialogue = if (result.hasKey("recognized_dialogue")) result.getString("recognized_dialogue") else ""
+    val summary = if (result.hasKey("audio_summary")) result.getString("audio_summary") else ""
+    val reason = if (result.hasKey("decision_reason")) result.getString("decision_reason") else ""
+    return "1차 추론 결과: is_emergency=$emergency, confidence=$confidence, crime_type=$crimeType, recognized_dialogue=$dialogue, audio_summary=$summary, decision_reason=$reason"
+  }
+
+  private fun emitAiCompletedDebug(
+    stage: String,
+    message: String,
+    source: String,
+    analysisPass: String,
+    result: WritableMap,
+    elapsedMs: Int,
+    finalDecision: Boolean,
+  ) {
+    emitAnalysisDebug(
+      stage,
+      Arguments.createMap().apply {
+        putString("message", message)
+        putString("trigger_source", source)
+        putString("analysis_pass", analysisPass)
+        putInt("elapsed_ms", elapsedMs)
+        putBoolean("is_emergency", safeBoolean(result, "is_emergency", false))
+        putBoolean("final_decision", finalDecision)
+        putBoolean("stt_context_used", false)
+        putString("crime_type", safeString(result, "crime_type"))
+        putString("situation_summary", safeString(result, "situation_summary"))
+        if (result.hasKey("confidence")) putString("confidence", safeString(result, "confidence"))
+        if (result.hasKey("recognized_dialogue")) putString("recognized_dialogue", safeString(result, "recognized_dialogue"))
+        if (result.hasKey("audio_summary")) putString("audio_summary", safeString(result, "audio_summary"))
+        if (result.hasKey("decision_reason")) putString("decision_reason", safeString(result, "decision_reason"))
+        if (result.hasKey("previous_primary_context")) putString("previous_primary_context", safeString(result, "previous_primary_context"))
+        if (result.hasKey("stt_transcript")) putString("stt_transcript", safeString(result, "stt_transcript"))
+        if (result.hasKey("stt_engine")) putString("stt_engine", safeString(result, "stt_engine"))
+        if (result.hasKey("stt_error")) putString("stt_error", safeString(result, "stt_error"))
+        if (result.hasKey("model_id")) putString("model_id", safeString(result, "model_id"))
+        if (result.hasKey("analysis_mode")) putString("analysis_mode", safeString(result, "analysis_mode"))
+        if (result.hasKey("litert_error")) putString("litert_error", safeString(result, "litert_error"))
+        if (result.hasKey("raw_model_response")) putString("raw_model_response", safeString(result, "raw_model_response"))
+      },
+    )
+  }
+
+
+  private fun cloneAnalysisResult(result: WritableMap): WritableMap =
+    Arguments.createMap().apply {
+      putBoolean("is_emergency", safeBoolean(result, "is_emergency", false))
+      putString("crime_type", safeString(result, "crime_type"))
+      putString("situation_summary", safeString(result, "situation_summary"))
+      putString("recognized_dialogue", safeString(result, "recognized_dialogue"))
+      putString("confidence", safeString(result, "confidence"))
+      putString("analysis_pass", safeString(result, "analysis_pass"))
+      putBoolean("final_decision", safeBoolean(result, "final_decision", false))
+      putString("audio_summary", safeString(result, "audio_summary"))
+      putBoolean("stt_context_used", safeBoolean(result, "stt_context_used", false))
+      putString("previous_primary_context", safeString(result, "previous_primary_context"))
+      putString("decision_reason", safeString(result, "decision_reason"))
+      putString("stt_transcript", safeString(result, "stt_transcript"))
+      putString("stt_engine", safeString(result, "stt_engine"))
+      putString("stt_error", safeString(result, "stt_error"))
+      putString("model_id", safeString(result, "model_id"))
+      putString("trigger_source", safeString(result, "trigger_source"))
+      putString("analysis_mode", safeString(result, "analysis_mode"))
+      putString("litert_error", safeString(result, "litert_error"))
+      putString("raw_model_response", safeString(result, "raw_model_response"))
+      if (result.hasKey("location")) {
+        runCatching { result.getMap("location") }.getOrNull()?.let { location ->
+          putMap("location", Arguments.createMap().apply {
+            runCatching { putDouble("latitude", location.getDouble("latitude")) }
+            runCatching { putDouble("longitude", location.getDouble("longitude")) }
+          })
+        }
+      }
+    }
+  private fun safeString(map: WritableMap, key: String, fallback: String = ""): String =
+    runCatching {
+      if (map.hasKey(key)) map.getString(key) ?: fallback else fallback
+    }.getOrDefault(fallback)
+
+  private fun safeBoolean(map: WritableMap, key: String, fallback: Boolean): Boolean =
+    runCatching {
+      if (map.hasKey(key)) map.getBoolean(key) else fallback
+    }.getOrDefault(fallback)
   private fun currentLocation(): LocationSnapshot? {
     if (
       ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED &&
@@ -397,8 +532,9 @@ class EmergencyForegroundService : Service(), SensorEventListener {
     return location?.let { LocationSnapshot(it.latitude, it.longitude) }
   }
 
-  private fun readRingBufferSnapshot(): AudioSnapshot {
-    val capturedSamples = minOf(totalReadSamples, ringBuffer.size.toLong()).toInt()
+  private fun readRingBufferSnapshot(maxSamples: Int = ringBuffer.size): AudioSnapshot {
+    val cappedMaxSamples = maxOf(0, minOf(maxSamples, ringBuffer.size))
+    val capturedSamples = minOf(totalReadSamples, cappedMaxSamples.toLong()).toInt()
     val snapshot = ShortArray(capturedSamples)
     val writeIndexSnapshot: Int
     synchronized(ringLock) {
@@ -450,6 +586,17 @@ class EmergencyForegroundService : Service(), SensorEventListener {
     )
   }
 
+  private fun combinePcmBase64(vararg clips: String): String {
+    val decoded = clips.map { Base64.decode(it, Base64.NO_WRAP) }
+    val totalSize = decoded.sumOf { it.size }
+    val combined = ByteArray(totalSize)
+    var offset = 0
+    decoded.forEach { clip ->
+      clip.copyInto(combined, offset)
+      offset += clip.size
+    }
+    return Base64.encodeToString(combined, Base64.NO_WRAP)
+  }
   private fun rms(buffer: ShortArray, read: Int, start: Int = 0): Double {
     if (read <= 0) return 0.0
     var sum = 0.0
@@ -524,6 +671,47 @@ class EmergencyForegroundService : Service(), SensorEventListener {
     getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
   }
 
+  private fun WritableMap.putAudioSnapshotFields(
+    audioSnapshot: AudioSnapshot,
+    location: LocationSnapshot?,
+    postCaptureMs: Int,
+  ) {
+    putInt("sample_rate", sampleRate)
+    putInt("audio_seconds", ringBuffer.size / sampleRate)
+    putDouble("captured_audio_seconds", audioSnapshot.sampleCount.toDouble() / sampleRate)
+    putDouble("buffer_filled_ratio", audioSnapshot.sampleCount.toDouble() / ringBuffer.size)
+    putInt("pcm_bytes", ringBuffer.size * 2)
+    putInt("sent_pcm_bytes", audioSnapshot.pcmBytes)
+    putDouble("sent_audio_seconds", audioSnapshot.sentSampleCount.toDouble() / sampleRate)
+    putInt("sent_start_offset_ms", audioSnapshot.sentStartOffsetMs)
+    putInt("sent_end_offset_ms", audioSnapshot.sentEndOffsetMs)
+    putInt("base64_length", audioSnapshot.base64.length)
+    putInt("recording_state", audioRecord?.recordingState ?: -1)
+    putInt("audio_record_state", audioRecord?.state ?: -1)
+    putInt("last_read_size", lastReadSize)
+    putDouble("last_read_rms", lastReadRms)
+    putDouble("last_read_peak", lastReadPeak)
+    putInt("last_audio_read_age_ms", audioSnapshot.lastAudioReadAgeMs)
+    putDouble("total_read_seconds", totalReadSamples.toDouble() / sampleRate)
+    putInt("ring_write_index", audioSnapshot.ringWriteIndex)
+    putInt("sent_sample_count", audioSnapshot.sentSampleCount)
+    putInt("non_zero_samples", audioSnapshot.nonZeroSamples)
+    putInt("non_silent_samples", audioSnapshot.nonSilentSamples)
+    putInt("non_silent_threshold", AUDIO_NON_SILENT_THRESHOLD)
+    putDouble("rms_full_buffer", audioSnapshot.rmsFullBuffer)
+    putDouble("rms_last_1s", audioSnapshot.rmsLastOneSecond)
+    putDouble("peak_full_buffer", audioSnapshot.peakFullBuffer)
+    putInt("first_non_silent_offset_ms", audioSnapshot.firstNonSilentOffsetMs)
+    putInt("last_non_silent_offset_ms", audioSnapshot.lastNonSilentOffsetMs)
+    putInt("post_capture_ms", postCaptureMs)
+    putBoolean("has_location", location != null)
+    location?.let {
+      putMap("location", Arguments.createMap().apply {
+        putDouble("latitude", it.latitude)
+        putDouble("longitude", it.longitude)
+      })
+    }
+  }
   private fun emitNativeError(code: String, message: String) {
     val event = Arguments.createMap()
     event.putString("code", code)
@@ -552,12 +740,16 @@ class EmergencyForegroundService : Service(), SensorEventListener {
     const val EXTRA_AUDIO_RMS_THRESHOLD = "audioRmsThreshold"
     const val EXTRA_MODEL_ID = "modelId"
     const val EXTRA_STT_ENABLED = "sttEnabled"
+    const val EXTRA_STT_ENGINE = "sttEngine"
     const val EXTRA_CUSTOM_PROMPT = "customPrompt"
     private const val TAG = "OnGuardEmergency"
     private const val CHANNEL_ID = "emergency_monitoring"
     private const val NOTIFICATION_ID = 11201
     private const val AUDIO_NON_SILENT_THRESHOLD = 128
-    private const val DEV_TRIGGER_POST_CAPTURE_MS = 3000
+    private const val DEV_TRIGGER_POST_CAPTURE_MS = 0
+    private const val SECONDARY_POST_CAPTURE_MS = 7000
+    private const val PRIMARY_ANALYSIS_PASS = "primary"
+    private const val SECONDARY_ANALYSIS_PASS = "secondary"
     private const val VAD_TRIM_PADDING_MS = 500
   }
 }
@@ -582,15 +774,3 @@ private data class AudioSnapshot(
   val lastNonSilentOffsetMs: Int,
   val lastAudioReadAgeMs: Int,
 )
-
-
-
-
-
-
-
-
-
-
-
-

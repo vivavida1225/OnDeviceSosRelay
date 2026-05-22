@@ -4,10 +4,4 @@ extensions.configure(com.facebook.react.ReactSettingsExtension){ ex -> ex.autoli
 rootProject.name = 'EmergencyCall'
 include ':app'
 
-def mlc4jDir = file("dist/lib/mlc4j")
-if (mlc4jDir.exists()) {
-    include ':mlc4j'
-    project(':mlc4j').projectDir = mlc4jDir
-}
-
 includeBuild('../node_modules/@react-native/gradle-plugin')

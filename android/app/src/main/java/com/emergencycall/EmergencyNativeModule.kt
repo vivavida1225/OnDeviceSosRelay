@@ -24,12 +24,12 @@ class EmergencyNativeModule(
   }
 
   init {
-    SherpaOnnxWhisperSttAnalyzer.ensureModelDirectories(reactContext)
+    SherpaOnnxMoonshineSttAnalyzer.ensureModelDirectories(reactContext)
   }
 
   @ReactMethod
   fun startMonitoring(config: ReadableMap, promise: Promise) {
-    SherpaOnnxWhisperSttAnalyzer.ensureModelDirectories(reactContext)
+    SherpaOnnxMoonshineSttAnalyzer.ensureModelDirectories(reactContext)
     val intent = Intent(reactContext, EmergencyForegroundService::class.java).apply {
       action = EmergencyForegroundService.ACTION_START
       putExtra(
@@ -47,6 +47,10 @@ class EmergencyNativeModule(
       putExtra(
         EmergencyForegroundService.EXTRA_STT_ENABLED,
         if (config.hasKey("sttEnabled")) config.getBoolean("sttEnabled") else false,
+      )
+      putExtra(
+        EmergencyForegroundService.EXTRA_STT_ENGINE,
+        if (config.hasKey("sttEngine")) config.getString("sttEngine") ?: SherpaOnnxMoonshineSttAnalyzer.ENGINE_OFF else SherpaOnnxMoonshineSttAnalyzer.ENGINE_OFF,
       )
       putExtra(
         EmergencyForegroundService.EXTRA_CUSTOM_PROMPT,
@@ -110,13 +114,36 @@ class EmergencyNativeModule(
 
   @ReactMethod
   fun loadAppSettings(promise: Promise) {
-    promise.resolve(preferences.getString("app_settings", """{"sttEnabled":false,"customPrompt":"","audioRmsThreshold":0.35}"""))
+    promise.resolve(preferences.getString("app_settings", """{"sttEngine":"off","customPrompt":"","audioRmsThreshold":0.35}"""))
   }
 
   @ReactMethod
   fun saveAppSettings(settingsJson: String, promise: Promise) {
     preferences.edit().putString("app_settings", settingsJson).apply()
     promise.resolve(true)
+  }
+
+
+  @ReactMethod
+  fun loadGemmaPrompts(promise: Promise) {
+    promise.resolve(GemmaPromptStore.loadJson(reactContext))
+  }
+
+  @ReactMethod
+  fun saveGemmaPrompts(promptsJson: String, promise: Promise) {
+    runCatching {
+      GemmaPromptStore.saveJson(reactContext, promptsJson)
+    }.onSuccess {
+      promise.resolve(true)
+    }.onFailure { error ->
+      promise.reject("PROMPT_SAVE_FAILED", error.message ?: "Failed to save Gemma prompts.")
+    }
+  }
+
+  @ReactMethod
+  fun resetGemmaPrompts(promise: Promise) {
+    GemmaPromptStore.reset(reactContext)
+    promise.resolve(GemmaPromptStore.loadJson(reactContext))
   }
 
   @ReactMethod
@@ -192,6 +219,9 @@ class EmergencyNativeModule(
       putInt("parts", parts)
     }
 }
+
+
+
 
 
 

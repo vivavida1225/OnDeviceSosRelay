@@ -1,4 +1,4 @@
-﻿import React, {useCallback, useEffect, useReducer, useRef, useState} from 'react';
+import React, {useCallback, useEffect, useReducer, useRef, useState} from 'react';
 import {
   Alert,
   Modal,
@@ -23,6 +23,8 @@ import {
   type AppSettings,
   type AudioLogEntry,
   type EmergencyAnalysis,
+  type GemmaPromptTemplates,
+  type SttEngine,
 } from './src/native/EmergencyNative';
 import {
   emergencyReducer,
@@ -30,6 +32,8 @@ import {
 } from './src/state/emergencyState';
 
 const DEFAULT_AUDIO_RMS_THRESHOLD = 0.35;
+const STT_ENGINE_OFF: SttEngine = 'off';
+const STT_ENGINE_ON: SttEngine = 'sherpa-onnx-moonshine-tiny-ko-quantized-2026-02-27';
 
 const baseMonitoringConfig = {
   modelId: 'gemma-4-E4B-it',
@@ -37,13 +41,20 @@ const baseMonitoringConfig = {
 };
 
 const DEFAULT_CUSTOM_PROMPT = `기본 프롬프트를 사용합니다.
-오디오와 STT 결과가 서로 충돌하면 실제 오디오의 톤, 긴급성, 배경 소음을 우선해 판단하세요.
+트리거 이전 10초와 이후 7초 오디오의 톤, 긴급성, 발화, 배경 소음만 근거로 판단하세요.
+STT 결과는 실험용 로그일 뿐 판단 근거로 사용하지 마세요.
 위급 상황 단서가 부족하면 보수적으로 false를 반환하세요.`;
 
 const defaultAppSettings: AppSettings = {
-  sttEnabled: false,
+  sttEngine: STT_ENGINE_OFF,
   customPrompt: DEFAULT_CUSTOM_PROMPT,
   audioRmsThreshold: DEFAULT_AUDIO_RMS_THRESHOLD,
+};
+
+const emptyGemmaPromptTemplates: GemmaPromptTemplates = {
+  system: '',
+  primary: '',
+  secondary: '',
 };
 type AnalysisLogEntry = EmergencyAnalysis & {
   id: string;
@@ -61,12 +72,16 @@ function App() {
   const [menuVisible, setMenuVisible] = useState(false);
   const [settingsVisible, setSettingsVisible] = useState(false);
   const [personalizationVisible, setPersonalizationVisible] = useState(false);
+  const [promptEditorVisible, setPromptEditorVisible] = useState(false);
   const [audioLogsVisible, setAudioLogsVisible] = useState(false);
   const [audioLogs, setAudioLogs] = useState<AudioLogEntry[]>([]);
   const [playingAudioId, setPlayingAudioId] = useState<string>();
-  const [sttEnabled, setSttEnabled] = useState(defaultAppSettings.sttEnabled);
+  const [sttEngine, setSttEngine] = useState<SttEngine>(defaultAppSettings.sttEngine);
   const [customPrompt, setCustomPrompt] = useState(defaultAppSettings.customPrompt);
   const [promptDraft, setPromptDraft] = useState(defaultAppSettings.customPrompt);
+  const [gemmaPromptDraft, setGemmaPromptDraft] = useState<GemmaPromptTemplates>(
+    emptyGemmaPromptTemplates,
+  );
   const [audioRmsThreshold, setAudioRmsThreshold] = useState(
     defaultAppSettings.audioRmsThreshold,
   );
@@ -87,6 +102,7 @@ function App() {
         console.warn('[EmergencyDebug] loadAnalysisLogs failed', error);
       });
   }, []);
+
   useEffect(() => {
     EmergencyNative.loadAppSettings()
       .then(settingsJson => {
@@ -94,12 +110,12 @@ function App() {
         const nextSettings = {
           ...defaultAppSettings,
           ...parsed,
-          sttEnabled: parsed.sttEnabled ?? defaultAppSettings.sttEnabled,
+          sttEngine: resolveSttEngine(parsed),
           customPrompt: parsed.customPrompt || defaultAppSettings.customPrompt,
           audioRmsThreshold:
             parsed.audioRmsThreshold ?? defaultAppSettings.audioRmsThreshold,
         };
-        setSttEnabled(nextSettings.sttEnabled);
+        setSttEngine(nextSettings.sttEngine);
         setCustomPrompt(nextSettings.customPrompt);
         setPromptDraft(nextSettings.customPrompt);
         setAudioRmsThreshold(nextSettings.audioRmsThreshold);
@@ -109,6 +125,26 @@ function App() {
         console.warn('[EmergencyDebug] loadAppSettings failed', error);
       });
   }, []);
+
+  const appendAnalysisLog = useCallback((event: EmergencyAnalysis) => {
+    setAnalysisLogs(logs => {
+      const nextLogs = [
+        {
+          ...event,
+          id: `${Date.now()}-${logs.length}`,
+          createdAt: new Date().toLocaleString(),
+        },
+        ...logs,
+      ].slice(0, 10);
+
+      EmergencyNative.saveAnalysisLogs(JSON.stringify(nextLogs)).catch(error => {
+        console.warn('[EmergencyDebug] saveAnalysisLogs failed', error);
+      });
+
+      return nextLogs;
+    });
+  }, []);
+
   useEffect(() => {
     if (!emergencyEvents) {
       return;
@@ -123,26 +159,12 @@ function App() {
         console.log('[EmergencyDebug] triggerDetected', event);
         dispatch({type: 'TRIGGER_DETECTED'});
       }),
+      emergencyEvents.addListener('analysisLog', event => {
+        console.log('[EmergencyDebug] analysisLog', event);
+        appendAnalysisLog(event);
+      }),
       emergencyEvents.addListener('analysisResult', event => {
         console.log('[EmergencyDebug] analysisResult', event);
-        setAnalysisLogs(logs => {
-          const nextLogs = [
-            {
-              ...event,
-              id: `${Date.now()}-${logs.length}`,
-              createdAt: new Date().toLocaleString(),
-            },
-            ...logs,
-          ].slice(0, 10);
-
-          EmergencyNative.saveAnalysisLogs(JSON.stringify(nextLogs)).catch(
-            error => {
-              console.warn('[EmergencyDebug] saveAnalysisLogs failed', error);
-            },
-          );
-
-          return nextLogs;
-        });
         dispatch({
           type: 'ANALYSIS_RESULT',
           analysis: event,
@@ -164,9 +186,8 @@ function App() {
       }),
     ];
 
-  return () => subscriptions.forEach(subscription => subscription.remove());
-  }, []);
-
+    return () => subscriptions.forEach(subscription => subscription.remove());
+  }, [appendAnalysisLog]);
   useEffect(() => {
     if (state.mode !== 'countdown') {
       return;
@@ -214,7 +235,7 @@ function App() {
     try {
       const logsJson = await EmergencyNative.loadAudioLogs();
       const logs = JSON.parse(logsJson);
-      setAudioLogs(Array.isArray(logs) ? logs.slice(0, 5) : []);
+      setAudioLogs(Array.isArray(logs) ? logs.slice(0, 10) : []);
     } catch (error) {
       console.warn('[EmergencyDebug] loadAudioLogs failed', error);
       setAudioLogs([]);
@@ -240,12 +261,67 @@ function App() {
   const savePrompt = useCallback(async () => {
     const nextPrompt = promptDraft.trim() || defaultAppSettings.customPrompt;
     setCustomPrompt(nextPrompt);
-    await saveSettings({sttEnabled, customPrompt: nextPrompt, audioRmsThreshold});
+    await saveSettings({sttEngine, customPrompt: nextPrompt, audioRmsThreshold});
     setPersonalizationVisible(false);
-  }, [audioRmsThreshold, promptDraft, saveSettings, sttEnabled]);
+  }, [audioRmsThreshold, promptDraft, saveSettings, sttEngine]);
 
   const restoreDefaultPrompt = useCallback(() => {
     setPromptDraft(defaultAppSettings.customPrompt);
+  }, []);
+
+  const openGemmaPromptEditor = useCallback(async () => {
+    setSettingsVisible(false);
+    try {
+      const promptsJson = await EmergencyNative.loadGemmaPrompts();
+      const parsed = JSON.parse(promptsJson) as GemmaPromptTemplates;
+      setGemmaPromptDraft({
+        system: parsed.system ?? '',
+        primary: parsed.primary ?? '',
+        secondary: parsed.secondary ?? '',
+      });
+      setPromptEditorVisible(true);
+    } catch (error) {
+      Alert.alert(
+        '프롬프트 로드 실패',
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }, []);
+
+  const updateGemmaPromptDraft = useCallback(
+    (key: keyof GemmaPromptTemplates, value: string) => {
+      setGemmaPromptDraft(current => ({...current, [key]: value}));
+    },
+    [],
+  );
+
+  const saveGemmaPrompts = useCallback(async () => {
+    try {
+      await EmergencyNative.saveGemmaPrompts(JSON.stringify(gemmaPromptDraft));
+      setPromptEditorVisible(false);
+    } catch (error) {
+      Alert.alert(
+        '프롬프트 저장 실패',
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }, [gemmaPromptDraft]);
+
+  const resetGemmaPrompts = useCallback(async () => {
+    try {
+      const promptsJson = await EmergencyNative.resetGemmaPrompts();
+      const parsed = JSON.parse(promptsJson) as GemmaPromptTemplates;
+      setGemmaPromptDraft({
+        system: parsed.system ?? '',
+        primary: parsed.primary ?? '',
+        secondary: parsed.secondary ?? '',
+      });
+    } catch (error) {
+      Alert.alert(
+        '프롬프트 원복 실패',
+        error instanceof Error ? error.message : String(error),
+      );
+    }
   }, []);
   const startMonitoring = useCallback(async () => {
     try {
@@ -254,7 +330,8 @@ function App() {
       const config = {
         ...baseMonitoringConfig,
         audioRmsThreshold,
-        sttEnabled,
+        sttEnabled: sttEngine !== STT_ENGINE_OFF,
+        sttEngine,
         customPrompt,
       };
       const warmUpStatus = await MlcGemmaNative.warmUp(config.modelId);
@@ -266,7 +343,7 @@ function App() {
         message: error instanceof Error ? error.message : '시작 실패',
       });
     }
-  }, [audioRmsThreshold, customPrompt, sttEnabled]);
+  }, [audioRmsThreshold, customPrompt, sttEngine]);
 
   const stopMonitoring = useCallback(async () => {
     await EmergencyNative.stopMonitoring();
@@ -304,10 +381,10 @@ function App() {
     state.mode === 'analyzing' ||
     state.mode === 'countdown';
 
-  const updateSttEnabled = useCallback(
-    async (enabled: boolean) => {
-      setSttEnabled(enabled);
-      await saveSettings({sttEnabled: enabled, customPrompt, audioRmsThreshold});
+  const updateSttEngine = useCallback(
+    async (nextEngine: SttEngine) => {
+      setSttEngine(nextEngine);
+      await saveSettings({sttEngine: nextEngine, customPrompt, audioRmsThreshold});
       if (!isMonitoring) {
         return;
       }
@@ -316,11 +393,12 @@ function App() {
         await EmergencyNative.startMonitoring({
           ...baseMonitoringConfig,
           audioRmsThreshold,
-          sttEnabled: enabled,
+          sttEnabled: nextEngine !== STT_ENGINE_OFF,
+          sttEngine: nextEngine,
           customPrompt,
         });
       } catch (error) {
-        console.warn('[EmergencyDebug] updateSttEnabled failed', error);
+        console.warn('[EmergencyDebug] updateSttEngine failed', error);
       }
     },
     [audioRmsThreshold, customPrompt, isMonitoring, saveSettings],
@@ -337,7 +415,7 @@ function App() {
     setAudioRmsThreshold(nextThreshold);
     setAudioRmsThresholdInput(String(nextThreshold));
     await saveSettings({
-      sttEnabled,
+      sttEngine,
       customPrompt,
       audioRmsThreshold: nextThreshold,
     });
@@ -350,7 +428,8 @@ function App() {
       await EmergencyNative.startMonitoring({
         ...baseMonitoringConfig,
         audioRmsThreshold: nextThreshold,
-        sttEnabled,
+        sttEnabled: sttEngine !== STT_ENGINE_OFF,
+        sttEngine,
         customPrompt,
       });
     } catch (error) {
@@ -362,7 +441,7 @@ function App() {
     customPrompt,
     isMonitoring,
     saveSettings,
-    sttEnabled,
+    sttEngine,
   ]);
   return (
     <SafeAreaView style={styles.safeArea}>
@@ -480,14 +559,20 @@ function App() {
               <View style={styles.settingTextGroup}>
                 <Text style={styles.settingLabel}>STT 기능</Text>
                 <Text style={styles.settingDescription}>
-                  Sherpa-ONNX Whisper 받아쓰기 채널을 켜거나 끕니다.
+                  실험용 로그 기능입니다. Moonshine tiny-ko가 트리거 이후 오디오를 받아쓰지만 Gemma 판단에는 사용되지 않습니다.
                 </Text>
               </View>
-              <Switch value={sttEnabled} onValueChange={updateSttEnabled} />
+              <Switch
+                value={sttEngine === STT_ENGINE_ON}
+                onValueChange={enabled => updateSttEngine(enabled ? STT_ENGINE_ON : STT_ENGINE_OFF)}
+              />
             </View>
             <Text style={styles.settingHint}>
-              감시 중 변경하면 다음 트리거부터 적용됩니다.
+              기본값은 OFF입니다. 켜도 신고 판단에는 영향을 주지 않고 로그에만 남습니다.
             </Text>
+            <Pressable style={styles.menuOption} onPress={openGemmaPromptEditor}>
+              <Text style={styles.menuOptionText}>프롬프트 수정</Text>
+            </Pressable>
             <Pressable
               style={styles.menuCloseButton}
               onPress={() => setSettingsVisible(false)}>
@@ -532,12 +617,60 @@ function App() {
         </SafeAreaView>
       </Modal>
 
+      <Modal visible={promptEditorVisible} animationType="slide">
+        <SafeAreaView style={styles.logsScreen}>
+          <View style={styles.logsHeader}>
+            <View>
+              <Text style={styles.logsTitle}>프롬프트 수정</Text>
+              <Text style={styles.logsSubtitle}>시스템 / 1차 / 2차 추론</Text>
+            </View>
+            <Pressable
+              style={styles.closeButton}
+              onPress={() => setPromptEditorVisible(false)}>
+              <Text style={styles.closeButtonText}>닫기</Text>
+            </Pressable>
+          </View>
+          <ScrollView contentContainerStyle={styles.logsContent}>
+            <Text style={styles.settingDescription}>
+              루트의 prompts/onguard_gemma_prompts.json이 기본값입니다. 여기서 저장한 내용은 이 기기 앱 설정에 override로 남고, 기본값 원복으로 언제든 되돌릴 수 있습니다.
+            </Text>
+            <PromptEditorField
+              label="시스템 프롬프트"
+              description="모델의 전역 역할과 출력 형식을 지정합니다."
+              value={gemmaPromptDraft.system}
+              onChangeText={value => updateGemmaPromptDraft('system', value)}
+              minHeight={180}
+            />
+            <PromptEditorField
+              label="1차 추론 프롬프트"
+              description="트리거 직전 최대 10초 오디오 분석 지침입니다. {{sampleRate}}, {{triggerSource}}, {{locationText}}, {{customPromptText}} 토큰을 사용할 수 있습니다."
+              value={gemmaPromptDraft.primary}
+              onChangeText={value => updateGemmaPromptDraft('primary', value)}
+              minHeight={360}
+            />
+            <PromptEditorField
+              label="2차 추론 프롬프트"
+              description="트리거 이후 7초 오디오 분석 지침입니다. 1차 토큰에 더해 {{previousContext}} 토큰을 사용할 수 있습니다."
+              value={gemmaPromptDraft.secondary}
+              onChangeText={value => updateGemmaPromptDraft('secondary', value)}
+              minHeight={360}
+            />
+            <Pressable style={styles.secondaryButton} onPress={resetGemmaPrompts}>
+              <Text style={styles.secondaryButtonText}>기본값으로 원복</Text>
+            </Pressable>
+            <Pressable style={styles.button} onPress={saveGemmaPrompts}>
+              <Text style={styles.buttonText}>저장</Text>
+            </Pressable>
+          </ScrollView>
+        </SafeAreaView>
+      </Modal>
+
       <Modal visible={audioLogsVisible} animationType="slide">
         <SafeAreaView style={styles.logsScreen}>
           <View style={styles.logsHeader}>
             <View>
               <Text style={styles.logsTitle}>오디오 로그</Text>
-              <Text style={styles.logsSubtitle}>최근 {audioLogs.length}개 / 최대 5개</Text>
+              <Text style={styles.logsSubtitle}>최근 {audioLogs.length}개 / 최대 10개</Text>
             </View>
             <Pressable
               style={styles.closeButton}
@@ -548,7 +681,7 @@ function App() {
               <Text style={styles.closeButtonText}>닫기</Text>
             </Pressable>
           </View>
-          <ScrollView contentContainerStyle={styles.logsContent}>
+          <ScrollView contentContainerStyle={[styles.logsContent, styles.audioLogsContent]}>
             <View style={styles.thresholdPanel}>
               <Text style={styles.settingLabel}>오디오 트리거 RMS 임계값</Text>
               <Text style={styles.settingDescription}>
@@ -577,6 +710,8 @@ function App() {
                   <Text style={styles.logIndex}>#{index + 1}</Text>
                   <LogRow label="time" value={formatAudioLogTime(log.createdAt)} />
                   <LogRow label="trigger_source" value={log.trigger_source} />
+                  <LogRow label="analysis_pass" value={formatAnalysisPass(log.analysis_pass)} />
+
                   <LogRow
                     label="duration_seconds"
                     value={log.duration_seconds.toFixed(1)}
@@ -596,10 +731,12 @@ function App() {
                 </View>
               ))
             )}
-            <Pressable style={styles.secondaryButton} onPress={stopAudioLog}>
-              <Text style={styles.secondaryButtonText}>재생 중지</Text>
-            </Pressable>
           </ScrollView>
+          <View style={styles.audioStopBar}>
+            <Pressable style={styles.audioStopButton} onPress={stopAudioLog}>
+              <Text style={styles.buttonText}>재생 중지</Text>
+            </Pressable>
+          </View>
         </SafeAreaView>
       </Modal>
       <Modal visible={logsVisible} animationType="slide">
@@ -627,8 +764,11 @@ function App() {
                   <LogRow label="analysis_mode" value={log.analysis_mode} />
                   <LogRow label="crime_type" value={log.crime_type} />
                   <LogRow label="is_emergency" value={String(log.is_emergency)} />
+                  <LogRow label="final_decision" value={String(log.final_decision ?? false)} />
                   <LogRow label="model_id" value={log.model_id} />
                   <LogRow label="trigger_source" value={log.trigger_source} />
+                  <LogRow label="analysis_pass" value={formatAnalysisPass(log.analysis_pass)} />
+
                   <LogRow
                     label="location"
                     value={formatLocation(log.location)}
@@ -636,6 +776,23 @@ function App() {
                   <LogRow
                     label="recognized_dialogue"
                     value={log.recognized_dialogue}
+                  />
+                  <LogRow label="confidence" value={log.confidence} />
+                  <LogRow
+                    label="audio_summary"
+                    value={log.audio_summary}
+                  />
+                  <LogRow
+                    label="stt_context_used"
+                    value={String(log.stt_context_used ?? false)}
+                  />
+                  <LogRow
+                    label="decision_reason"
+                    value={log.decision_reason}
+                  />
+                  <LogRow
+                    label="previous_primary_context"
+                    value={log.previous_primary_context}
                   />
                   <LogRow
                     label="stt_transcript"
@@ -663,6 +820,35 @@ function App() {
   );
 }
 
+function PromptEditorField({
+  label,
+  description,
+  value,
+  onChangeText,
+  minHeight,
+}: {
+  label: string;
+  description: string;
+  value: string;
+  onChangeText: (value: string) => void;
+  minHeight: number;
+}) {
+  return (
+    <View style={styles.promptEditorSection}>
+      <Text style={styles.settingLabel}>{label}</Text>
+      <Text style={styles.settingDescription}>{description}</Text>
+      <TextInput
+        style={[styles.promptInput, {minHeight}]}
+        value={value}
+        onChangeText={onChangeText}
+        multiline
+        textAlignVertical="top"
+        autoCapitalize="none"
+        autoCorrect={false}
+      />
+    </View>
+  );
+}
 function LogRow({
   label,
   value,
@@ -684,6 +870,28 @@ function LogRow({
       </Text>
     </View>
   );
+}
+
+function resolveSttEngine(settings: Partial<AppSettings> & {sttEnabled?: boolean}): SttEngine {
+  if (settings.sttEngine === STT_ENGINE_OFF) {
+    return STT_ENGINE_OFF;
+  }
+
+  if (settings.sttEngine || settings.sttEnabled) {
+    return STT_ENGINE_ON;
+  }
+
+  return STT_ENGINE_OFF;
+}
+
+function formatAnalysisPass(pass?: string) {
+  if (pass === 'primary') {
+    return '1차 추론';
+  }
+  if (pass === 'secondary') {
+    return '2차 추론';
+  }
+  return pass;
 }
 
 function formatLocation(location?: {latitude: number; longitude: number}) {
@@ -996,6 +1204,9 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
+  promptEditorSection: {
+    gap: 8,
+  },
   promptInput: {
     minHeight: 260,
     backgroundColor: '#ffffff',
@@ -1047,6 +1258,22 @@ const styles = StyleSheet.create({
     padding: 16,
     gap: 12,
   },
+  audioLogsContent: {
+    paddingBottom: 96,
+  },
+  audioStopBar: {
+    borderTopWidth: 1,
+    borderTopColor: '#e5e7eb',
+    backgroundColor: '#f7f8fb',
+    padding: 16,
+  },
+  audioStopButton: {
+    backgroundColor: '#111827',
+    borderRadius: 8,
+    minHeight: 52,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   emptyLogs: {
     color: '#4b5563',
     fontSize: 16,
@@ -1085,19 +1312,6 @@ const styles = StyleSheet.create({
 });
 
 export default App;
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
