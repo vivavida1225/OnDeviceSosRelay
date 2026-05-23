@@ -76,8 +76,10 @@ object LiteRtGemmaAnalyzer {
     customPrompt: String = "",
     analysisPass: String = "primary",
     previousContext: String = "",
+    monitoringMode: String = GemmaPromptStore.MODE_ADULT,
   ): WritableMap {
-    Log.i(TAG, "analyze_start pass=$analysisPass sampleRate=$sampleRate base64Length=${pcmBase64.length} sttContextUsed=false")
+    val normalizedMonitoringMode = GemmaPromptStore.normalizeMode(monitoringMode)
+    Log.i(TAG, "analyze_start pass=$analysisPass monitoringMode=$normalizedMonitoringMode sampleRate=$sampleRate base64Length=${pcmBase64.length} sttContextUsed=false")
     val pcmBytes = runCatching { Base64.decode(pcmBase64, Base64.NO_WRAP) }.getOrDefault(ByteArray(0))
     val warmUpStatus = warmUp(context, warmedModelId)
     if (!warmUpStatus.getBoolean("ready")) {
@@ -88,10 +90,11 @@ object LiteRtGemmaAnalyzer {
         sttTranscript = sttTranscript,
         analysisPass = analysisPass,
         previousContext = previousContext,
+        monitoringMode = normalizedMonitoringMode,
       )
     }
 
-    val prompt = buildPrompt(context, sampleRate, location, triggerSource, sttTranscript, customPrompt, analysisPass, previousContext)
+    val prompt = buildPrompt(context, sampleRate, location, triggerSource, sttTranscript, customPrompt, analysisPass, previousContext, normalizedMonitoringMode)
     val wavBytes = WavPcm.pcm16Base64ToWavBytes(pcmBytes, sampleRate)
     Log.i(TAG, "analyze_payload_ready pcmBytes=${pcmBytes.size} wavBytes=${wavBytes.size} promptLength=${prompt.length}")
 
@@ -99,7 +102,7 @@ object LiteRtGemmaAnalyzer {
       Log.i(TAG, "create_conversation_enter")
       val response = engine!!.createConversation(
         ConversationConfig(
-          systemInstruction = Contents.of(GemmaPromptStore.systemInstruction(context)),
+          systemInstruction = Contents.of(GemmaPromptStore.systemInstruction(context, normalizedMonitoringMode)),
         ),
       ).use { conversation: Conversation ->
         Log.i(TAG, "send_message_enter")
@@ -111,10 +114,10 @@ object LiteRtGemmaAnalyzer {
         ).toString().also { Log.i(TAG, "send_message_return responseLength=${it.length}") }
       }
 
-      parseModelJson(response, location, triggerSource, sttTranscript, analysisPass, previousContext)
-        ?: failClosed("LiteRT-LM response was not valid emergency JSON: $response", location, triggerSource, sttTranscript, analysisPass, previousContext)
+      parseModelJson(response, location, triggerSource, sttTranscript, analysisPass, previousContext, normalizedMonitoringMode)
+        ?: failClosed("LiteRT-LM response was not valid emergency JSON: $response", location, triggerSource, sttTranscript, analysisPass, previousContext, normalizedMonitoringMode)
     }.getOrElse { error ->
-      failClosed(error.message ?: error.javaClass.simpleName, location, triggerSource, sttTranscript, analysisPass, previousContext)
+      failClosed(error.message ?: error.javaClass.simpleName, location, triggerSource, sttTranscript, analysisPass, previousContext, normalizedMonitoringMode)
     }
   }
 
@@ -148,12 +151,14 @@ object LiteRtGemmaAnalyzer {
     customPrompt: String,
     analysisPass: String,
     previousContext: String,
+    monitoringMode: String,
   ): String {
     val locationText = location?.let { "${it.latitude}, ${it.longitude}" } ?: "unknown"
     val customPromptText = customPrompt.trim().ifBlank { "개인화 추가 지침 없음" }
     return if (analysisPass == "secondary") {
       GemmaPromptStore.secondaryPrompt(
         context = context,
+        monitoringMode = monitoringMode,
         sampleRate = sampleRate,
         locationText = locationText,
         triggerSource = triggerSource,
@@ -163,6 +168,7 @@ object LiteRtGemmaAnalyzer {
     } else {
       GemmaPromptStore.primaryPrompt(
         context = context,
+        monitoringMode = monitoringMode,
         sampleRate = sampleRate,
         locationText = locationText,
         triggerSource = triggerSource,
@@ -178,6 +184,7 @@ object LiteRtGemmaAnalyzer {
     sttTranscript: String,
     analysisPass: String,
     previousContext: String,
+    monitoringMode: String,
   ): WritableMap? {
     val jsonText = response.substringAfter('{', "").substringBeforeLast('}', "")
     if (jsonText.isBlank()) return null
@@ -192,6 +199,7 @@ object LiteRtGemmaAnalyzer {
       putString("audio_summary", sanitizeModelField(json.optString("audio_summary", "오디오 요약 없음")))
       putString("decision_reason", sanitizeModelField(json.optString("decision_reason", "판단 근거 없음")))
       putString("analysis_pass", analysisPass)
+      putString("monitoring_mode", monitoringMode)
       putBoolean("stt_context_used", false)
       if (previousContext.isNotBlank()) putString("previous_primary_context", previousContext)
       putString("stt_transcript", sttTranscript)
@@ -238,6 +246,7 @@ object LiteRtGemmaAnalyzer {
     sttTranscript: String = "",
     analysisPass: String = "primary",
     previousContext: String = "",
+    monitoringMode: String = GemmaPromptStore.MODE_ADULT,
   ): WritableMap =
     Arguments.createMap().apply {
       putBoolean("is_emergency", false)
@@ -248,6 +257,7 @@ object LiteRtGemmaAnalyzer {
       putString("audio_summary", "분석 실패")
       putString("decision_reason", "LiteRT-LM 분석 실패: $reason")
       putString("analysis_pass", analysisPass)
+      putString("monitoring_mode", GemmaPromptStore.normalizeMode(monitoringMode))
       putBoolean("stt_context_used", false)
       if (previousContext.isNotBlank()) putString("previous_primary_context", previousContext)
       putString("stt_transcript", sttTranscript)

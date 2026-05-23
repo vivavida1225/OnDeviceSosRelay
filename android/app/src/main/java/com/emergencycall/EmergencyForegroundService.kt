@@ -42,6 +42,7 @@ class EmergencyForegroundService : Service(), SensorEventListener {
   private var audioRmsThreshold = 0.35
   private var sttEngine = SherpaOnnxMoonshineSttAnalyzer.ENGINE_OFF
   private var customPrompt = ""
+  private var monitoringMode = GemmaPromptStore.MODE_ADULT
   private var lastReadSize = 0
   private var lastReadRms = 0.0
   private var lastReadPeak = 0.0
@@ -98,7 +99,8 @@ class EmergencyForegroundService : Service(), SensorEventListener {
     sttEngine = intent.getStringExtra(EXTRA_STT_ENGINE)
       ?: if (intent.getBooleanExtra(EXTRA_STT_ENABLED, false)) SherpaOnnxMoonshineSttAnalyzer.ENGINE_MOONSHINE_TINY_KO else SherpaOnnxMoonshineSttAnalyzer.ENGINE_OFF
     customPrompt = intent.getStringExtra(EXTRA_CUSTOM_PROMPT) ?: ""
-    Log.i(TAG, "startMonitoring: sttEngine=$sttEngine")
+    monitoringMode = GemmaPromptStore.normalizeMode(intent.getStringExtra(EXTRA_MONITORING_MODE))
+    Log.i(TAG, "startMonitoring: sttEngine=$sttEngine monitoringMode=$monitoringMode")
     val modelId = intent.getStringExtra(EXTRA_MODEL_ID) ?: "gemma-4-E4B-it"
     Log.i(TAG, "startMonitoring: warmUp requested modelId=$modelId monitoring=$monitoring")
     val warmUpResult = LiteRtGemmaAnalyzer.warmUp(this, modelId)
@@ -110,6 +112,7 @@ class EmergencyForegroundService : Service(), SensorEventListener {
       event.putString("status", "monitoring")
       event.putString("reason", "already_monitoring_rearmed")
       event.putString("model_id", modelId)
+      event.putString("monitoring_mode", monitoringMode)
       EmergencyEventBus.emit("serviceStatus", event)
       return
     }
@@ -123,6 +126,7 @@ class EmergencyForegroundService : Service(), SensorEventListener {
     val event = Arguments.createMap()
     event.putString("status", "monitoring")
     event.putString("model_id", modelId)
+    event.putString("monitoring_mode", monitoringMode)
     EmergencyEventBus.emit("serviceStatus", event)
   }
 
@@ -271,6 +275,7 @@ class EmergencyForegroundService : Service(), SensorEventListener {
           putString("trigger_source", source)
           putString("analysis_pass", PRIMARY_ANALYSIS_PASS)
           putBoolean("stt_context_used", false)
+          putString("monitoring_mode", monitoringMode)
         },
       )
 
@@ -285,6 +290,7 @@ class EmergencyForegroundService : Service(), SensorEventListener {
         customPrompt = customPrompt,
         analysisPass = PRIMARY_ANALYSIS_PASS,
         previousContext = "",
+        monitoringMode = monitoringMode,
       )
       val primaryEmergency = primaryResult.getBoolean("is_emergency")
       decorateAnalysisResult(primaryResult, PRIMARY_ANALYSIS_PASS, finalDecision = primaryEmergency, sttResult = null)
@@ -313,6 +319,7 @@ class EmergencyForegroundService : Service(), SensorEventListener {
           putString("analysis_pass", SECONDARY_ANALYSIS_PASS)
           putString("previous_primary_context", primaryContext)
           putBoolean("stt_context_used", false)
+          putString("monitoring_mode", monitoringMode)
           sttResult.error?.let { putString("stt_error", it) }
         },
       )
@@ -328,6 +335,7 @@ class EmergencyForegroundService : Service(), SensorEventListener {
         customPrompt = customPrompt,
         analysisPass = SECONDARY_ANALYSIS_PASS,
         previousContext = primaryContext,
+        monitoringMode = monitoringMode,
       )
       decorateAnalysisResult(secondaryResult, SECONDARY_ANALYSIS_PASS, finalDecision = true, sttResult = sttResult)
       secondaryResult.putString("previous_primary_context", primaryContext)
@@ -342,6 +350,7 @@ class EmergencyForegroundService : Service(), SensorEventListener {
         val monitoringStatus = Arguments.createMap()
         monitoringStatus.putString("status", "monitoring")
         monitoringStatus.putString("reason", "secondary_non_emergency_analysis")
+        monitoringStatus.putString("monitoring_mode", monitoringMode)
         EmergencyEventBus.emit("serviceStatus", monitoringStatus)
       }
     }
@@ -386,6 +395,7 @@ class EmergencyForegroundService : Service(), SensorEventListener {
         putString("stt_engine", sttEngine)
         putBoolean("stt_enabled", sttEnabled)
         putBoolean("used_for_gemma_decision", false)
+        putString("monitoring_mode", monitoringMode)
       },
     )
 
@@ -410,6 +420,7 @@ class EmergencyForegroundService : Service(), SensorEventListener {
         putInt("stt_elapsed_ms", result.elapsedMs)
         putBoolean("stt_enabled", sttEnabled)
         putBoolean("used_for_gemma_decision", false)
+        putString("monitoring_mode", monitoringMode)
         result.error?.let { putString("stt_error", it) }
       },
     )
@@ -423,6 +434,7 @@ class EmergencyForegroundService : Service(), SensorEventListener {
     sttResult: SttResult?,
   ) {
     result.putString("analysis_pass", analysisPass)
+    result.putString("monitoring_mode", monitoringMode)
     result.putBoolean("final_decision", finalDecision)
     result.putBoolean("stt_context_used", false)
     result.putString("stt_transcript", sttResult?.transcript ?: "")
@@ -455,6 +467,7 @@ class EmergencyForegroundService : Service(), SensorEventListener {
         putString("message", message)
         putString("trigger_source", source)
         putString("analysis_pass", analysisPass)
+        putString("monitoring_mode", monitoringMode)
         putInt("elapsed_ms", elapsedMs)
         putBoolean("is_emergency", safeBoolean(result, "is_emergency", false))
         putBoolean("final_decision", finalDecision)
@@ -471,6 +484,7 @@ class EmergencyForegroundService : Service(), SensorEventListener {
         if (result.hasKey("stt_error")) putString("stt_error", safeString(result, "stt_error"))
         if (result.hasKey("model_id")) putString("model_id", safeString(result, "model_id"))
         if (result.hasKey("analysis_mode")) putString("analysis_mode", safeString(result, "analysis_mode"))
+        if (result.hasKey("monitoring_mode")) putString("monitoring_mode", safeString(result, "monitoring_mode"))
         if (result.hasKey("litert_error")) putString("litert_error", safeString(result, "litert_error"))
         if (result.hasKey("raw_model_response")) putString("raw_model_response", safeString(result, "raw_model_response"))
       },
@@ -486,6 +500,7 @@ class EmergencyForegroundService : Service(), SensorEventListener {
       putString("recognized_dialogue", safeString(result, "recognized_dialogue"))
       putString("confidence", safeString(result, "confidence"))
       putString("analysis_pass", safeString(result, "analysis_pass"))
+      putString("monitoring_mode", safeString(result, "monitoring_mode", monitoringMode))
       putBoolean("final_decision", safeBoolean(result, "final_decision", false))
       putString("audio_summary", safeString(result, "audio_summary"))
       putBoolean("stt_context_used", safeBoolean(result, "stt_context_used", false))
@@ -742,6 +757,7 @@ class EmergencyForegroundService : Service(), SensorEventListener {
     const val EXTRA_STT_ENABLED = "sttEnabled"
     const val EXTRA_STT_ENGINE = "sttEngine"
     const val EXTRA_CUSTOM_PROMPT = "customPrompt"
+    const val EXTRA_MONITORING_MODE = "monitoringMode"
     private const val TAG = "OnGuardEmergency"
     private const val CHANNEL_ID = "emergency_monitoring"
     private const val NOTIFICATION_ID = 11201

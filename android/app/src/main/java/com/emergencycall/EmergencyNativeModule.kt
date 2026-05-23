@@ -56,6 +56,10 @@ class EmergencyNativeModule(
         EmergencyForegroundService.EXTRA_CUSTOM_PROMPT,
         if (config.hasKey("customPrompt")) config.getString("customPrompt") ?: "" else "",
       )
+      putExtra(
+        EmergencyForegroundService.EXTRA_MONITORING_MODE,
+        GemmaPromptStore.normalizeMode(if (config.hasKey("monitoringMode")) config.getString("monitoringMode") else null),
+      )
     }
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
       reactContext.startForegroundService(intent)
@@ -125,14 +129,14 @@ class EmergencyNativeModule(
 
 
   @ReactMethod
-  fun loadGemmaPrompts(promise: Promise) {
-    promise.resolve(GemmaPromptStore.loadJson(reactContext))
+  fun loadGemmaPrompts(monitoringMode: String, promise: Promise) {
+    promise.resolve(GemmaPromptStore.loadJson(reactContext, monitoringMode))
   }
 
   @ReactMethod
-  fun saveGemmaPrompts(promptsJson: String, promise: Promise) {
+  fun saveGemmaPrompts(monitoringMode: String, promptsJson: String, promise: Promise) {
     runCatching {
-      GemmaPromptStore.saveJson(reactContext, promptsJson)
+      GemmaPromptStore.saveJson(reactContext, monitoringMode, promptsJson)
     }.onSuccess {
       promise.resolve(true)
     }.onFailure { error ->
@@ -141,9 +145,9 @@ class EmergencyNativeModule(
   }
 
   @ReactMethod
-  fun resetGemmaPrompts(promise: Promise) {
-    GemmaPromptStore.reset(reactContext)
-    promise.resolve(GemmaPromptStore.loadJson(reactContext))
+  fun resetGemmaPrompts(monitoringMode: String, promise: Promise) {
+    GemmaPromptStore.reset(reactContext, monitoringMode)
+    promise.resolve(GemmaPromptStore.loadJson(reactContext, monitoringMode))
   }
 
   @ReactMethod

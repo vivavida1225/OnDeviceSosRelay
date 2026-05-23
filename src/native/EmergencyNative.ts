@@ -7,6 +7,34 @@ export type EmergencyLocation = {
 
 export type SttEngine = 'off' | 'sherpa-onnx-moonshine-tiny-ko-quantized-2026-02-27';
 
+export type SafetyMode = 'child' | 'adult';
+
+export type RoutineLocation = {
+  latitude: number;
+  longitude: number;
+  address: string;
+};
+
+export type RoutePathPoint = {
+  latitude: number;
+  longitude: number;
+};
+
+export type SafetyProfile = {
+  mode: SafetyMode | null;
+  birthday: string;
+  gender: string;
+  emergencyPhone: string;
+  detailAddress: string;
+  startLocation: RoutineLocation | null;
+  destinationLocation: RoutineLocation | null;
+  childRoutePath: RoutePathPoint[];
+  startHour: string;
+  startMinute: string;
+  destinationHour: string;
+  destinationMinute: string;
+};
+
 export type GemmaPromptTemplates = {
   system: string;
   primary: string;
@@ -21,6 +49,7 @@ export type EmergencyAnalysis = {
   model_id?: string;
   trigger_source?: string;
   analysis_mode?: string;
+  monitoring_mode?: SafetyMode;
   litert_error?: string;
   recognized_dialogue?: string;
   confidence?: string;
@@ -42,6 +71,7 @@ export type MonitoringConfig = {
   audioRmsThreshold: number;
   sttEnabled: boolean;
   sttEngine: SttEngine;
+  monitoringMode: SafetyMode;
   customPrompt?: string;
 };
 
@@ -49,6 +79,7 @@ export type AppSettings = {
   sttEngine: SttEngine;
   customPrompt: string;
   audioRmsThreshold: number;
+  safetyProfile: SafetyProfile;
 };
 
 export type AudioLogEntry = {
@@ -73,9 +104,9 @@ type EmergencyNativeModule = {
   saveAnalysisLogs(logsJson: string): Promise<boolean>;
   loadAppSettings(): Promise<string>;
   saveAppSettings(settingsJson: string): Promise<boolean>;
-  loadGemmaPrompts(): Promise<string>;
-  saveGemmaPrompts(promptsJson: string): Promise<boolean>;
-  resetGemmaPrompts(): Promise<string>;
+  loadGemmaPrompts(monitoringMode: SafetyMode): Promise<string>;
+  saveGemmaPrompts(monitoringMode: SafetyMode, promptsJson: string): Promise<boolean>;
+  resetGemmaPrompts(monitoringMode: SafetyMode): Promise<string>;
   loadAudioLogs(): Promise<string>;
   playAudioLog(id: string): Promise<boolean>;
   stopAudioLog(): Promise<boolean>;
