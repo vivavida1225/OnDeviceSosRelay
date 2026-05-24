@@ -102,6 +102,7 @@ type EmergencyNativeModule = {
   stopSiren(): Promise<boolean>;
   loadAnalysisLogs(): Promise<string>;
   saveAnalysisLogs(logsJson: string): Promise<boolean>;
+  geocodeAddress(address: string): Promise<EmergencyLocation & {address?: string}>;
   loadAppSettings(): Promise<string>;
   saveAppSettings(settingsJson: string): Promise<boolean>;
   loadGemmaPrompts(monitoringMode: SafetyMode): Promise<string>;
@@ -148,6 +149,7 @@ export const EmergencyNative: EmergencyNativeModule =
         stopSiren: () => missingModule('EmergencyNative'),
         loadAnalysisLogs: () => missingModule('EmergencyNative'),
         saveAnalysisLogs: () => missingModule('EmergencyNative'),
+        geocodeAddress: () => missingModule('EmergencyNative'),
         loadAppSettings: () => missingModule('EmergencyNative'),
         saveAppSettings: () => missingModule('EmergencyNative'),
         loadGemmaPrompts: () => missingModule('EmergencyNative'),

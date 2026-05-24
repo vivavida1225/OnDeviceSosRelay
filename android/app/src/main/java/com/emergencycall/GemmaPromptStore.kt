@@ -72,10 +72,13 @@ object GemmaPromptStore {
 
   fun reset(context: Context, monitoringMode: String? = MODE_ADULT) {
     val mode = normalizeMode(monitoringMode)
-    context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    val editor = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
       .edit()
       .remove(prefKeyFor(mode))
-      .apply()
+    if (mode == MODE_ADULT) {
+      editor.remove(LEGACY_PREF_KEY)
+    }
+    editor.apply()
   }
 
   fun systemInstruction(context: Context, monitoringMode: String? = MODE_ADULT): String =

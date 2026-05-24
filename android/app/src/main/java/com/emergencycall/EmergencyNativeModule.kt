@@ -1,9 +1,11 @@
-﻿package com.emergencycall
+package com.emergencycall
 
 import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.location.Address
+import android.location.Geocoder
 import android.os.Build
 import android.telephony.SmsManager
 import androidx.core.content.ContextCompat
@@ -13,6 +15,8 @@ import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
 import com.facebook.react.bridge.ReactMethod
 import com.facebook.react.bridge.ReadableMap
+import com.facebook.react.bridge.UiThreadUtil
+import java.util.Locale
 
 class EmergencyNativeModule(
   private val reactContext: ReactApplicationContext,
@@ -106,6 +110,44 @@ class EmergencyNativeModule(
   }
 
   @ReactMethod
+  fun geocodeAddress(address: String, promise: Promise) {
+    val query = address.trim()
+    if (query.isEmpty()) {
+      promise.reject("GEOCODE_EMPTY", "Address is empty.")
+      return
+    }
+
+    if (!Geocoder.isPresent()) {
+      promise.reject("GEOCODER_UNAVAILABLE", "Android Geocoder is not available on this device.")
+      return
+    }
+
+    val geocoder = Geocoder(reactContext, Locale.KOREA)
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+      geocoder.getFromLocationName(query, 5, object : Geocoder.GeocodeListener {
+        override fun onGeocode(addresses: MutableList<Address>) {
+          resolveGeocodeAddresses(query, addresses, promise)
+        }
+
+        override fun onError(errorMessage: String?) {
+          rejectGeocode(promise, "GEOCODE_FAILED", errorMessage ?: "Failed to geocode address.")
+        }
+      })
+      return
+    }
+
+    Thread {
+      try {
+        @Suppress("DEPRECATION")
+        val addresses = geocoder.getFromLocationName(query, 5).orEmpty()
+        resolveGeocodeAddresses(query, addresses, promise)
+      } catch (error: Exception) {
+        rejectGeocode(promise, "GEOCODE_FAILED", error.message ?: "Failed to geocode address.")
+      }
+    }.start()
+  }
+
+  @ReactMethod
   fun loadAnalysisLogs(promise: Promise) {
     promise.resolve(preferences.getString("analysis_logs", "[]"))
   }
@@ -147,7 +189,7 @@ class EmergencyNativeModule(
   @ReactMethod
   fun resetGemmaPrompts(monitoringMode: String, promise: Promise) {
     GemmaPromptStore.reset(reactContext, monitoringMode)
-    promise.resolve(GemmaPromptStore.loadJson(reactContext, monitoringMode))
+    promise.resolve(GemmaPromptStore.loadDefaultJson(reactContext, monitoringMode))
   }
 
   @ReactMethod
@@ -222,6 +264,30 @@ class EmergencyNativeModule(
       putString("destination", destination)
       putInt("parts", parts)
     }
+
+  private fun resolveGeocodeAddresses(query: String, addresses: List<Address>, promise: Promise) {
+    val resultAddress = addresses.firstOrNull { it.hasLatitude() && it.hasLongitude() }
+    if (resultAddress == null) {
+      rejectGeocode(promise, "GEOCODE_EMPTY", "No coordinates returned for address.")
+      return
+    }
+
+    val result = Arguments.createMap().apply {
+      putDouble("latitude", resultAddress.latitude)
+      putDouble("longitude", resultAddress.longitude)
+      putString("address", resultAddress.getAddressLine(0) ?: query)
+    }
+
+    UiThreadUtil.runOnUiThread {
+      promise.resolve(result)
+    }
+  }
+
+  private fun rejectGeocode(promise: Promise, code: String, message: String) {
+    UiThreadUtil.runOnUiThread {
+      promise.reject(code, message)
+    }
+  }
 }
 
 

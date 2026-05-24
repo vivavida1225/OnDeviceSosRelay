@@ -44,6 +44,11 @@ const STT_ENGINE_OFF: SttEngine = 'off';
 const STT_ENGINE_ON: SttEngine = 'sherpa-onnx-moonshine-tiny-ko-quantized-2026-02-27';
 type LocationPickerTarget = 'startLocation' | 'destinationLocation';
 type RoutePickerMode = 'view' | 'edit';
+type LocationPickerAddressSelection = {
+  type: 'addressSelected';
+  address?: string;
+  candidates?: string[];
+};
 
 const baseMonitoringConfig = {
   modelId: 'gemma-4-E4B-it',
@@ -52,7 +57,6 @@ const baseMonitoringConfig = {
 
 const DEFAULT_CUSTOM_PROMPT = `기본 프롬프트를 사용합니다.
 트리거 이전 10초와 이후 7초 오디오의 톤, 긴급성, 발화, 배경 소음만 근거로 판단하세요.
-STT 결과는 실험용 로그일 뿐 판단 근거로 사용하지 마세요.
 위급 상황 단서가 부족하면 보수적으로 false를 반환하세요.`;
 
 const defaultSafetyProfile: SafetyProfile = {
@@ -122,6 +126,7 @@ function App() {
   );
   const smsSentForAnalysis = useRef<EmergencyAnalysis | undefined>(undefined);
   const lastBackPressAt = useRef(0);
+  const locationPickerWebViewRef = useRef<WebView>(null);
 
   useEffect(() => {
     EmergencyNative.loadAnalysisLogs()
@@ -391,6 +396,59 @@ function App() {
     setLocationPickerTarget(target);
   }, []);
 
+  const injectLocationPickerGeocodeResult = useCallback(
+    (payload: {address?: string; latitude?: number; longitude?: number; error?: string}) => {
+      locationPickerWebViewRef.current?.injectJavaScript(
+        `window.renderNativeGeocodeResult && window.renderNativeGeocodeResult(${JSON.stringify(payload)}); true;`,
+      );
+    },
+    [],
+  );
+
+  const geocodeLocationPickerAddress = useCallback(
+    async (candidates: string[]) => {
+      const uniqueCandidates = Array.from(
+        new Set(candidates.map(candidate => candidate.trim()).filter(Boolean)),
+      );
+
+      if (uniqueCandidates.length === 0) {
+        injectLocationPickerGeocodeResult({
+          error: '선택한 주소가 비어 있습니다. 다른 주소를 선택해 주세요.',
+        });
+        return;
+      }
+
+      for (const candidate of uniqueCandidates) {
+        try {
+          console.log('[LocationPicker] nativeGeocode request', candidate);
+          const result = await EmergencyNative.geocodeAddress(candidate);
+          console.log('[LocationPicker] nativeGeocode response', candidate, result);
+          if (
+            result &&
+            typeof result.latitude === 'number' &&
+            typeof result.longitude === 'number' &&
+            Number.isFinite(result.latitude) &&
+            Number.isFinite(result.longitude)
+          ) {
+            injectLocationPickerGeocodeResult({
+              address: candidate,
+              latitude: result.latitude,
+              longitude: result.longitude,
+            });
+            return;
+          }
+        } catch (error) {
+          console.warn('[LocationPicker] nativeGeocode failed', candidate, error);
+        }
+      }
+
+      injectLocationPickerGeocodeResult({
+        error: '선택한 주소의 좌표를 찾지 못했습니다. 더 구체적인 주소 결과를 선택해 주세요.',
+      });
+    },
+    [injectLocationPickerGeocodeResult],
+  );
+
   const handleLocationPickerMessage = useCallback(
     (event: WebViewMessageEvent) => {
       if (!locationPickerTarget) {
@@ -400,10 +458,25 @@ function App() {
       try {
         const payload = JSON.parse(event.nativeEvent.data) as
           | (RoutineLocation & {type?: 'location'})
+          | LocationPickerAddressSelection
+          | {type: 'locationPickerDebug'; message: string}
           | {type: 'close'}
           | {error?: string};
+        if ('type' in payload && payload.type === 'locationPickerDebug') {
+          console.log('[LocationPicker]', payload.message);
+          return;
+        }
+
         if ('type' in payload && payload.type === 'close') {
           setLocationPickerTarget(null);
+          return;
+        }
+
+        if ('type' in payload && payload.type === 'addressSelected') {
+          geocodeLocationPickerAddress([
+            ...(Array.isArray(payload.candidates) ? payload.candidates : []),
+            typeof payload.address === 'string' ? payload.address : '',
+          ]);
           return;
         }
 
@@ -439,7 +512,7 @@ function App() {
         );
       }
     },
-    [locationPickerTarget],
+    [geocodeLocationPickerAddress, locationPickerTarget],
   );
 
   const openRoutePicker = useCallback(() => {
@@ -759,6 +832,7 @@ function App() {
         <LocationPickerModal
           visible={locationPickerTarget !== null}
           kakaoKey={KAKAO_MAP_JAVASCRIPT_KEY}
+          webViewRef={locationPickerWebViewRef}
           onClose={() => setLocationPickerTarget(null)}
           onMessage={handleLocationPickerMessage}
         />
@@ -999,6 +1073,7 @@ function App() {
       <LocationPickerModal
         visible={locationPickerTarget !== null}
         kakaoKey={KAKAO_MAP_JAVASCRIPT_KEY}
+        webViewRef={locationPickerWebViewRef}
         onClose={() => setLocationPickerTarget(null)}
         onMessage={handleLocationPickerMessage}
       />
@@ -1558,11 +1633,13 @@ function LocationSelectButton({
 function LocationPickerModal({
   visible,
   kakaoKey,
+  webViewRef,
   onClose,
   onMessage,
 }: {
   visible: boolean;
   kakaoKey: string;
+  webViewRef: React.RefObject<WebView | null>;
   onClose: () => void;
   onMessage: (event: WebViewMessageEvent) => void;
 }) {
@@ -1570,6 +1647,7 @@ function LocationPickerModal({
     <Modal visible={visible} animationType="slide" onRequestClose={onClose}>
       <SafeAreaView style={styles.locationPickerScreen}>
         <WebView
+          ref={webViewRef}
           source={{html: buildKakaoLocationPickerHtml(kakaoKey), baseUrl: 'http://localhost'}}
           originWhitelist={['*']}
           javaScriptEnabled
@@ -1891,26 +1969,323 @@ function buildKakaoLocationPickerHtml(kakaoKey: string) {
     var marker = null;
     var selectedAddress = '';
     var isDraggingMarker = false;
+    var geocodeDiagnostics = [];
 
     ${kakaoSharedJs()}
 
-    function geocodeAddress(address) {
+    function debug(message) {
+      var alertMessage = message.length > 240 ? message.slice(0, 240) + '...' : message;
+      geocodeDiagnostics.push(alertMessage);
+      if (window.console && window.console.log) {
+        window.console.log('[LocationPicker] ' + message);
+      }
+      post({ type: 'locationPickerDebug', message: message });
+    }
+
+    function snapshot(value, depth, seen) {
+      var type = typeof value;
+      if (value === null || type === 'string' || type === 'number' || type === 'boolean' || type === 'undefined') {
+        return value;
+      }
+      if (type === 'function') {
+        return '[Function]';
+      }
+      if (seen.indexOf(value) >= 0) {
+        return '[Circular]';
+      }
+      if (depth >= 4) {
+        return '[' + Object.prototype.toString.call(value) + ']';
+      }
+
+      seen.push(value);
+      var keys = Object.keys(value).slice(0, 24);
+      var output = {
+        __type: Object.prototype.toString.call(value),
+        __keys: keys,
+      };
+      for (var i = 0; i < keys.length; i += 1) {
+        var key = keys[i];
+        output[key] = snapshot(value[key], depth + 1, seen);
+      }
+      seen.pop();
+      return output;
+    }
+
+    function stringifyDebug(value) {
+      try {
+        return JSON.stringify(snapshot(value, 0, []));
+      } catch (error) {
+        return String(value);
+      }
+    }
+
+    function debugChunked(label, value) {
+      var text = label + '=' + stringifyDebug(value);
+      var maxLength = 900;
+      for (var i = 0; i < text.length; i += maxLength) {
+        debug(text.slice(i, i + maxLength));
+      }
+    }
+
+    function debugKakaoCallback(label, candidate, result, status) {
+      debug(label + ' meta candidate=' + candidate +
+        ' resultType=' + typeof result +
+        ' resultString=' + String(result) +
+        ' resultLength=' + (result && typeof result.length !== 'undefined' ? result.length : 'n/a') +
+        ' statusType=' + typeof status +
+        ' statusString=' + String(status));
+      debugChunked(label + ' result', result);
+      debugChunked(label + ' status', status);
+    }
+
+    function failWithDiagnostics(message) {
+      var suffix = geocodeDiagnostics.length > 0
+        ? '\\n\\n디버그 로그는 logcat/Metro 콘솔의 [LocationPicker] 항목을 확인해 주세요.\\n최근 로그:\\n' + geocodeDiagnostics.slice(-3).join('\\n')
+        : '';
+      fail(message + suffix);
+    }
+
+    function unique(values) {
+      var seen = {};
+      return values
+        .map(function(value) { return (value || '').trim(); })
+        .filter(function(value) {
+          if (!value || seen[value]) { return false; }
+          seen[value] = true;
+          return true;
+        });
+    }
+
+    function addressCandidates(data) {
+      var roadCandidate = data.roadAddress || data.autoRoadAddress || '';
+      var jibunCandidate = data.jibunAddress || data.autoJibunAddress || '';
+      var primary = data.userSelectedType === 'J' ? jibunCandidate : roadCandidate;
+      var fallback = data.userSelectedType === 'J' ? roadCandidate : jibunCandidate;
+      return unique([
+        primary,
+        fallback,
+        data.address,
+        data.roadAddress,
+        data.jibunAddress,
+        data.autoRoadAddress,
+        data.autoJibunAddress,
+      ]);
+    }
+
+    function hasSameArea(place, data, candidate) {
+      var text = [
+        place.address_name,
+        place.road_address_name,
+        place.place_name,
+      ].filter(Boolean).join(' ');
+      if (!text) { return false; }
+      if (data.sigungu && text.indexOf(data.sigungu) < 0) { return false; }
+      if (data.roadname && text.indexOf(data.roadname) >= 0) { return true; }
+      if (data.bname && text.indexOf(data.bname) >= 0) { return true; }
+      return text.replace(/\\s/g, '').indexOf(candidate.replace(/\\s/g, '')) >= 0;
+    }
+
+    function coordinateValue(source, keys) {
+      for (var i = 0; i < keys.length; i += 1) {
+        var raw = source ? source[keys[i]] : null;
+        var numeric = Number(raw);
+        if (raw !== null && raw !== undefined && isFinite(numeric)) {
+          return numeric;
+        }
+      }
+      return null;
+    }
+
+    function validCoordinates(latitude, longitude) {
+      return isFinite(latitude) &&
+        isFinite(longitude) &&
+        latitude >= -90 &&
+        latitude <= 90 &&
+        longitude >= -180 &&
+        longitude <= 180;
+    }
+
+    function coordinatesFromResult(value, depth) {
+      if (!value || depth > 8) { return null; }
+
+      if (typeof value.getLat === 'function' && typeof value.getLng === 'function') {
+        var methodLatitude = Number(value.getLat());
+        var methodLongitude = Number(value.getLng());
+        if (validCoordinates(methodLatitude, methodLongitude)) {
+          return { latitude: methodLatitude, longitude: methodLongitude };
+        }
+      }
+
+      var latitude = coordinateValue(value, ['y', 'Y', 'lat', 'latitude', 'Lat', 'Latitude', 'Ma', 'ha']);
+      var longitude = coordinateValue(value, ['x', 'X', 'lng', 'longitude', 'lon', 'Long', 'Longitude', 'La', 'qa']);
+      if (latitude !== null && longitude !== null && validCoordinates(latitude, longitude)) {
+        return { latitude: latitude, longitude: longitude };
+      }
+
+      if (
+        value.length === 2 &&
+        value[0] !== null &&
+        value[0] !== undefined &&
+        value[1] !== null &&
+        value[1] !== undefined
+      ) {
+        var first = Number(value[0]);
+        var second = Number(value[1]);
+        if (validCoordinates(second, first)) {
+          return { latitude: second, longitude: first };
+        }
+        if (validCoordinates(first, second)) {
+          return { latitude: first, longitude: second };
+        }
+      }
+
+      var nestedKeys = ['address', 'road_address', '0'];
+      for (var i = 0; i < nestedKeys.length; i += 1) {
+        var nested = coordinatesFromResult(value[nestedKeys[i]], depth + 1);
+        if (nested) { return nested; }
+      }
+
+      var keys = Object.keys(value);
+      for (var keyIndex = 0; keyIndex < keys.length; keyIndex += 1) {
+        var key = keys[keyIndex];
+        if (/^\\d+$/.test(key) || key === 'coords' || key === 'position' || key === 'point') {
+          var keyCoordinates = coordinatesFromResult(value[key], depth + 1);
+          if (keyCoordinates) { return keyCoordinates; }
+        }
+      }
+
+      if (typeof value.length === 'number') {
+        for (var j = 0; j < value.length; j += 1) {
+          var itemCoordinates = coordinatesFromResult(value[j], depth + 1);
+          if (itemCoordinates) { return itemCoordinates; }
+        }
+      }
+      return null;
+    }
+
+    function hasSameAreaDeep(value, data, candidate, depth) {
+      if (!value || depth > 4) { return false; }
+      if (hasSameArea(value, data, candidate)) { return true; }
+      var keys = Object.keys(value);
+      for (var i = 0; i < keys.length; i += 1) {
+        var key = keys[i];
+        if (/^\\d+$/.test(key) || key === 'address' || key === 'road_address') {
+          if (hasSameAreaDeep(value[key], data, candidate, depth + 1)) {
+            return true;
+          }
+        }
+      }
+      return false;
+    }
+
+    function coordinatesFromResults(results, data, candidate, requireSameArea) {
+      if (!results || !results.length) { return null; }
+      for (var i = 0; i < results.length; i += 1) {
+        var coordinates = coordinatesFromResult(results[i], 0);
+        if (coordinates && (!requireSameArea || hasSameAreaDeep(results[i], data, candidate, 0))) {
+          return coordinates;
+        }
+      }
+      return null;
+    }
+
+    function shape(value, depth) {
+      if (!value || depth > 3) { return []; }
+      var keys = Object.keys(value).slice(0, 12);
+      var nested = {};
+      for (var i = 0; i < keys.length; i += 1) {
+        var key = keys[i];
+        if (/^\\d+$/.test(key) || key === 'address' || key === 'road_address') {
+          nested[key] = shape(value[key], depth + 1);
+        }
+      }
+      return { keys: keys, nested: nested };
+    }
+
+    function resultShapeForDebug(results) {
+      if (!results || !results.length || !results[0]) { return 'empty-result'; }
+      return JSON.stringify(shape(results[0], 0));
+    }
+
+    function geocodeAddress(data) {
+      geocodeDiagnostics = [];
+      var candidates = addressCandidates(data);
+      var displayAddress = candidates[0];
+      if (!displayAddress) { fail('Selected address is empty.'); return; }
+      selectedAddress = displayAddress;
+      debugChunked('postcodeData', data);
+      debug('selectedSummary=' + JSON.stringify({
+        userSelectedType: data.userSelectedType,
+        sido: data.sido,
+        sigungu: data.sigungu,
+        bname: data.bname,
+        roadname: data.roadname,
+        candidates: candidates,
+      }));
+
+      setText('postcode', '좌표를 확인하는 중...');
+      post({ type: 'addressSelected', address: displayAddress, candidates: candidates });
+    }
+
+    window.renderNativeGeocodeResult = function(payload) {
+      if (!payload || payload.error) {
+        fail(payload && payload.error ? payload.error : '선택한 주소의 좌표를 찾지 못했습니다. 더 구체적인 주소 결과를 선택해 주세요.');
+        return;
+      }
+
+      var latitude = Number(payload.latitude);
+      var longitude = Number(payload.longitude);
+      if (!validCoordinates(latitude, longitude)) {
+        fail('주소 좌표 응답 형식이 올바르지 않습니다.');
+        return;
+      }
+
       waitForKakaoSdk(function() {
         window.kakao.maps.load(function() {
-          if (!window.kakao.maps.services || !window.kakao.maps.services.Geocoder) {
-            fail('Kakao Maps Geocoder service could not be initialized.');
-            return;
-          }
-          var geocoder = new window.kakao.maps.services.Geocoder();
-          geocoder.addressSearch(address, function(result, status) {
-            if (status === window.kakao.maps.services.Status.OK && result && result[0]) {
-              renderMap(address, Number(result[0].y), Number(result[0].x));
-            } else {
-              fail('Could not convert the address to coordinates.');
-            }
-          });
+          renderMap(payload.address || selectedAddress, latitude, longitude);
         });
       }, 0);
+    };
+
+    function tryGeocodeCandidate(geocoder, candidates, index, data) {
+      if (index >= candidates.length) {
+        tryPlaceCandidate(candidates, 0, data);
+        return;
+      }
+
+      geocoder.addressSearch(candidates[index], function(result, status) {
+        debugKakaoCallback('addressSearch', candidates[index], result, status);
+        var coordinates = coordinatesFromResults(result, data, candidates[index], false);
+        if (coordinates) {
+          renderMap(candidates[index], coordinates.latitude, coordinates.longitude);
+        } else {
+          debug('addressSearch shape=' + resultShapeForDebug(result));
+          tryGeocodeCandidate(geocoder, candidates, index + 1, data);
+        }
+      });
+    }
+
+    function tryPlaceCandidate(candidates, index, data) {
+      if (!window.kakao.maps.services || !window.kakao.maps.services.Places) {
+        failWithDiagnostics('선택한 주소의 좌표를 찾지 못했습니다. 더 구체적인 주소 결과를 선택해 주세요.');
+        return;
+      }
+      if (index >= candidates.length) {
+        failWithDiagnostics('선택한 주소의 좌표를 찾지 못했습니다. 더 구체적인 주소 결과를 선택해 주세요.');
+        return;
+      }
+
+      var places = new window.kakao.maps.services.Places();
+      places.keywordSearch(candidates[index], function(result, status) {
+        debugKakaoCallback('keywordSearch', candidates[index], result, status);
+        var coordinates = coordinatesFromResults(result, data, candidates[index], true);
+        if (coordinates) {
+          renderMap(candidates[index], coordinates.latitude, coordinates.longitude);
+          return;
+        }
+        debug('keywordSearch shape=' + resultShapeForDebug(result));
+        tryPlaceCandidate(candidates, index + 1, data);
+      });
     }
 
     function renderMap(address, latitude, longitude) {
@@ -1953,9 +2328,7 @@ function buildKakaoLocationPickerHtml(kakaoKey: string) {
         width: '100%',
         height: '100%',
         oncomplete: function(data) {
-          var address = data.roadAddress || data.jibunAddress || data.address;
-          if (!address) { fail('Selected address is empty.'); return; }
-          geocodeAddress(address);
+          geocodeAddress(data);
         }
       }).embed(document.getElementById('postcode'));
     }
