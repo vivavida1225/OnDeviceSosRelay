@@ -1,8 +1,11 @@
-import React, {useCallback, useEffect, useReducer, useRef, useState} from 'react';
+import React, {useCallback, useEffect, useMemo, useReducer, useRef, useState} from 'react';
 import {
   Alert,
   BackHandler,
+  type LayoutChangeEvent,
   Modal,
+  PanResponder,
+  type PanResponderGestureState,
   PermissionsAndroid,
   Platform,
   Pressable,
@@ -26,11 +29,14 @@ import {
   type AppSettings,
   type AudioLogEntry,
   type EmergencyAnalysis,
+  type EmergencyLocation,
   type GemmaPromptTemplates,
+  type MonitoringConfig,
   type RoutineLocation,
   type RoutePathPoint,
   type SafetyMode,
   type SafetyProfile,
+  type SavedRoute,
   type SttEngine,
 } from './src/native/EmergencyNative';
 import {
@@ -40,10 +46,30 @@ import {
 import {KAKAO_MAP_JAVASCRIPT_KEY} from './src/config/kakaoMap';
 
 const DEFAULT_AUDIO_RMS_THRESHOLD = 0.35;
+const DEFAULT_SENSOR_THRESHOLD = 28;
+const DEFAULT_GYRO_THRESHOLD = 8;
+const DEFAULT_PRE_TRIGGER_SECONDS = 10;
+const DEFAULT_POST_TRIGGER_SECONDS = 7;
+const DEFAULT_ROUTE_DEVIATION_DISTANCE_METERS = 50;
+const DEFAULT_ROUTE_DEVIATION_DURATION_SECONDS = 20;
+const MIN_ANALYSIS_WINDOW_SECONDS = 1;
+const MAX_ANALYSIS_WINDOW_SECONDS = 30;
+const MAX_SAVED_ROUTES = 5;
 const STT_ENGINE_OFF: SttEngine = 'off';
 const STT_ENGINE_ON: SttEngine = 'sherpa-onnx-moonshine-tiny-ko-quantized-2026-02-27';
 type LocationPickerTarget = 'startLocation' | 'destinationLocation';
 type RoutePickerMode = 'view' | 'edit';
+type RouteCapturePhase = 'confirm' | 'collecting' | 'review';
+type ManualRouteFlowPhase = 'idle' | 'start' | 'destination' | 'route';
+type RoutePickerPurpose = 'manualCreate' | 'savedRouteEdit' | null;
+type RouteScheduleKey = 'startHour' | 'startMinute' | 'destinationHour' | 'destinationMinute';
+type RouteInfoDraft = Pick<SavedRoute, 'name' | RouteScheduleKey>;
+type RouteDeviationStatus = {
+  route_deviation: boolean;
+  distance_meters?: number;
+  threshold_meters?: number;
+  duration_seconds?: number;
+};
 type LocationPickerAddressSelection = {
   type: 'addressSelected';
   address?: string;
@@ -52,11 +78,10 @@ type LocationPickerAddressSelection = {
 
 const baseMonitoringConfig = {
   modelId: 'gemma-4-E4B-it',
-  sensorThreshold: 28,
 };
 
 const DEFAULT_CUSTOM_PROMPT = `기본 프롬프트를 사용합니다.
-트리거 이전 10초와 이후 7초 오디오의 톤, 긴급성, 발화, 배경 소음만 근거로 판단하세요.
+사용자가 설정한 트리거 이전/이후 오디오의 톤, 긴급성, 발화, 배경 소음만 근거로 판단하세요.
 위급 상황 단서가 부족하면 보수적으로 false를 반환하세요.`;
 
 const defaultSafetyProfile: SafetyProfile = {
@@ -68,6 +93,8 @@ const defaultSafetyProfile: SafetyProfile = {
   startLocation: null,
   destinationLocation: null,
   childRoutePath: [],
+  savedRoutes: [],
+  activeRouteId: '',
   startHour: '',
   startMinute: '',
   destinationHour: '',
@@ -75,17 +102,25 @@ const defaultSafetyProfile: SafetyProfile = {
 };
 const defaultAppSettings: AppSettings = {
   sttEngine: STT_ENGINE_OFF,
+  sirenEnabled: false,
   customPrompt: DEFAULT_CUSTOM_PROMPT,
+  sensorThreshold: DEFAULT_SENSOR_THRESHOLD,
+  gyroThreshold: DEFAULT_GYRO_THRESHOLD,
   audioRmsThreshold: DEFAULT_AUDIO_RMS_THRESHOLD,
+  preTriggerSeconds: DEFAULT_PRE_TRIGGER_SECONDS,
+  postTriggerSeconds: DEFAULT_POST_TRIGGER_SECONDS,
+  routeDeviationDistanceMeters: DEFAULT_ROUTE_DEVIATION_DISTANCE_METERS,
+  routeDeviationDurationSeconds: DEFAULT_ROUTE_DEVIATION_DURATION_SECONDS,
   safetyProfile: defaultSafetyProfile,
 };
+const DEADMAN_SIREN_DURATION_MS = 5000;
 
 const emptyGemmaPromptTemplates: GemmaPromptTemplates = {
   system: '',
   primary: '',
   secondary: '',
 };
-type AnalysisLogEntry = EmergencyAnalysis & {
+type AnalysisLogEntry = Omit<EmergencyAnalysis, 'situation_summary' | 'stt_context_used'> & {
   id: string;
   createdAt: string;
 };
@@ -107,6 +142,7 @@ function App() {
   const [audioLogs, setAudioLogs] = useState<AudioLogEntry[]>([]);
   const [playingAudioId, setPlayingAudioId] = useState<string>();
   const [sttEngine, setSttEngine] = useState<SttEngine>(defaultAppSettings.sttEngine);
+  const [sirenEnabled, setSirenEnabled] = useState(defaultAppSettings.sirenEnabled);
   const [customPrompt, setCustomPrompt] = useState(defaultAppSettings.customPrompt);
   const [monitoringMode, setMonitoringMode] = useState<SafetyMode>('adult');
   const [promptEditorMode, setPromptEditorMode] = useState<SafetyMode>('adult');
@@ -118,22 +154,83 @@ function App() {
   const [locationPickerTarget, setLocationPickerTarget] = useState<LocationPickerTarget | null>(null);
   const [routePickerVisible, setRoutePickerVisible] = useState(false);
   const [routePickerMode, setRoutePickerMode] = useState<RoutePickerMode>('edit');
+  const [routePickerPurpose, setRoutePickerPurpose] = useState<RoutePickerPurpose>(null);
+  const [editingSavedRouteId, setEditingSavedRouteId] = useState<string | null>(null);
+  const [manualRouteFlowPhase, setManualRouteFlowPhase] = useState<ManualRouteFlowPhase>('idle');
+  const [manualRouteInfoDraft, setManualRouteInfoDraft] = useState<RouteInfoDraft>(() =>
+    createRouteInfoDraft(),
+  );
+  const [manualRouteInfoVisible, setManualRouteInfoVisible] = useState(false);
+  const [pendingManualRoutePath, setPendingManualRoutePath] = useState<RoutePathPoint[]>([]);
+  const [routeCaptureVisible, setRouteCaptureVisible] = useState(false);
+  const [routeCapturePhase, setRouteCapturePhase] = useState<RouteCapturePhase>('confirm');
+  const [routeCaptureStart, setRouteCaptureStart] = useState<RoutineLocation | null>(null);
+  const [routeCaptureEnd, setRouteCaptureEnd] = useState<RoutineLocation | null>(null);
+  const [routeCaptureWaypoints, setRouteCaptureWaypoints] = useState<RoutePathPoint[]>([]);
+  const [routeCaptureInfoDraft, setRouteCaptureInfoDraft] = useState<RouteInfoDraft>(() =>
+    createRouteInfoDraft(),
+  );
   const [audioRmsThreshold, setAudioRmsThreshold] = useState(
     defaultAppSettings.audioRmsThreshold,
+  );
+  const [sensorThreshold, setSensorThreshold] = useState(
+    defaultAppSettings.sensorThreshold,
+  );
+  const [gyroThreshold, setGyroThreshold] = useState(
+    defaultAppSettings.gyroThreshold,
+  );
+  const [preTriggerSeconds, setPreTriggerSeconds] = useState(
+    defaultAppSettings.preTriggerSeconds,
+  );
+  const [postTriggerSeconds, setPostTriggerSeconds] = useState(
+    defaultAppSettings.postTriggerSeconds,
+  );
+  const [routeDeviationDistanceMeters, setRouteDeviationDistanceMeters] = useState(
+    defaultAppSettings.routeDeviationDistanceMeters,
+  );
+  const [routeDeviationDurationSeconds, setRouteDeviationDurationSeconds] = useState(
+    defaultAppSettings.routeDeviationDurationSeconds,
   );
   const [audioRmsThresholdInput, setAudioRmsThresholdInput] = useState(
     String(defaultAppSettings.audioRmsThreshold),
   );
+  const [sensorThresholdInput, setSensorThresholdInput] = useState(
+    String(defaultAppSettings.sensorThreshold),
+  );
+  const [gyroThresholdInput, setGyroThresholdInput] = useState(
+    String(defaultAppSettings.gyroThreshold),
+  );
+  const [routeDeviationDistanceInput, setRouteDeviationDistanceInput] = useState(
+    String(defaultAppSettings.routeDeviationDistanceMeters),
+  );
+  const [routeDeviationDurationInput, setRouteDeviationDurationInput] = useState(
+    String(defaultAppSettings.routeDeviationDurationSeconds),
+  );
+  const [routeDeviationStatus, setRouteDeviationStatus] = useState<RouteDeviationStatus | null>(null);
+  const [routeStatusVisible, setRouteStatusVisible] = useState(false);
+  const [routeStatusLocation, setRouteStatusLocation] = useState<EmergencyLocation | null>(null);
+  const [routeStatusMapVersion, setRouteStatusMapVersion] = useState(0);
+  const [routeStatusMapStatusText, setRouteStatusMapStatusText] = useState('경로 일치');
+  const routeStatusWebViewRef = useRef<WebView>(null);
   const smsSentForAnalysis = useRef<EmergencyAnalysis | undefined>(undefined);
   const lastBackPressAt = useRef(0);
+  const profileDraftRef = useRef<SafetyProfile>(defaultSafetyProfile);
   const locationPickerWebViewRef = useRef<WebView>(null);
+
+  useEffect(() => {
+    profileDraftRef.current = profileDraft;
+  }, [profileDraft]);
 
   useEffect(() => {
     EmergencyNative.loadAnalysisLogs()
       .then(logsJson => {
         const logs = JSON.parse(logsJson);
         if (Array.isArray(logs)) {
-          setAnalysisLogs(logs.slice(0, 10));
+          setAnalysisLogs(
+            logs
+              .map(log => omitUnusedAnalysisLogFields(log) as AnalysisLogEntry)
+              .slice(0, 10),
+          );
         }
       })
       .catch(error => {
@@ -147,9 +244,20 @@ function App() {
         const parsed = JSON.parse(settingsJson) as Partial<AppSettings>;
         const nextSettings = normalizeAppSettings(parsed);
         setSttEngine(nextSettings.sttEngine);
+        setSirenEnabled(nextSettings.sirenEnabled);
         setCustomPrompt(nextSettings.customPrompt);
+        setSensorThreshold(nextSettings.sensorThreshold);
+        setGyroThreshold(nextSettings.gyroThreshold);
         setAudioRmsThreshold(nextSettings.audioRmsThreshold);
+        setPreTriggerSeconds(nextSettings.preTriggerSeconds);
+        setPostTriggerSeconds(nextSettings.postTriggerSeconds);
+        setRouteDeviationDistanceMeters(nextSettings.routeDeviationDistanceMeters);
+        setRouteDeviationDurationSeconds(nextSettings.routeDeviationDurationSeconds);
         setAudioRmsThresholdInput(String(nextSettings.audioRmsThreshold));
+        setSensorThresholdInput(String(nextSettings.sensorThreshold));
+        setGyroThresholdInput(String(nextSettings.gyroThreshold));
+        setRouteDeviationDistanceInput(String(nextSettings.routeDeviationDistanceMeters));
+        setRouteDeviationDurationInput(String(nextSettings.routeDeviationDurationSeconds));
         setSafetyProfile(nextSettings.safetyProfile);
         setProfileDraft(nextSettings.safetyProfile);
         setMonitoringMode(nextSettings.safetyProfile.mode ?? 'adult');
@@ -168,9 +276,10 @@ function App() {
 
   const appendAnalysisLog = useCallback((event: EmergencyAnalysis) => {
     setAnalysisLogs(logs => {
+      const logEvent = omitUnusedAnalysisLogFields(event);
       const nextLogs = [
         {
-          ...event,
+          ...logEvent,
           id: `${Date.now()}-${logs.length}`,
           createdAt: new Date().toLocaleString(),
         },
@@ -212,10 +321,40 @@ function App() {
       }),
       emergencyEvents.addListener('analysisDebug', event => {
         console.log(`[EmergencyDebug] ${event.stage}`, event);
+        if (event.stage === 'primary_ai_started') {
+          dispatch({type: 'ANALYSIS_PASS_STARTED', analysisPass: 'primary'});
+        }
+        if (event.stage === 'secondary_ai_started') {
+          dispatch({type: 'ANALYSIS_PASS_STARTED', analysisPass: 'secondary'});
+        }
       }),
       emergencyEvents.addListener('smsStatus', event => {
         console.log('[EmergencyDebug] smsStatus', event);
         dispatch({type: 'SMS_STATUS', status: event.status});
+      }),
+      emergencyEvents.addListener('routeCaptureUpdate', event => {
+        console.log('[RouteCapture]', event);
+        const start = normalizeRoutineLocation(event.start);
+        const end = normalizeRoutineLocation(event.end);
+        if (start) {
+          setRouteCaptureStart(start);
+        }
+        if (end) {
+          setRouteCaptureEnd(end);
+        }
+        setRouteCaptureWaypoints(normalizeRoutePath(event.waypoints));
+      }),
+      emergencyEvents.addListener('routeDeviationStatus', event => {
+        console.log('[RouteDeviation]', event);
+        setRouteDeviationStatus({
+          route_deviation: Boolean(event.route_deviation),
+          distance_meters:
+            typeof event.distance_meters === 'number' ? event.distance_meters : undefined,
+          threshold_meters:
+            typeof event.threshold_meters === 'number' ? event.threshold_meters : undefined,
+          duration_seconds:
+            typeof event.duration_seconds === 'number' ? event.duration_seconds : undefined,
+        });
       }),
       emergencyEvents.addListener('nativeError', event => {
         console.warn('[EmergencyDebug] nativeError', event);
@@ -234,11 +373,16 @@ function App() {
     }
 
     Vibration.vibrate([0, 500, 200, 500], true);
+    if (sirenEnabled) {
+      EmergencyNative.startSiren(DEADMAN_SIREN_DURATION_MS).catch(error => {
+        console.warn('[EmergencyDebug] startSiren failed', error);
+      });
+    }
     return () => {
       Vibration.cancel();
       EmergencyNative.stopSiren().catch(() => undefined);
     };
-  }, [state.mode]);
+  }, [sirenEnabled, state.mode]);
 
   useEffect(() => {
     if (state.mode !== 'countdown') {
@@ -254,9 +398,18 @@ function App() {
 
     if (state.analysis && smsSentForAnalysis.current !== state.analysis) {
       smsSentForAnalysis.current = state.analysis;
+      const destination = normalizePhoneNumber(safetyProfile.emergencyPhone);
+      if (!destination) {
+        dispatch({
+          type: 'ERROR',
+          message: '비상 전화번호가 등록되어 있지 않습니다.',
+        });
+        return;
+      }
       EmergencyNative.sendEmergencySms({
-        destination: '01082014333',
-        situation_summary: state.analysis.situation_summary,
+        destination,
+        situation_summary:
+          formatAnalysisSummary(state.analysis) ?? '위급 상황이 감지되었습니다.',
         location: state.analysis.location,
       }).catch(error => {
         dispatch({
@@ -265,11 +418,46 @@ function App() {
         });
       });
     }
-  }, [state.analysis, state.countdown, state.mode]);
+  }, [safetyProfile.emergencyPhone, state.analysis, state.countdown, state.mode]);
 
   const saveSettings = useCallback(async (nextSettings: AppSettings) => {
     await EmergencyNative.saveAppSettings(JSON.stringify(nextSettings));
   }, []);
+
+  const buildMonitoringConfig = useCallback(
+    (overrides: Partial<MonitoringConfig> = {}): MonitoringConfig => {
+      const routePath = safetyProfile.childRoutePath.length >= 2 ? safetyProfile.childRoutePath : [];
+      return {
+        ...baseMonitoringConfig,
+        sensorThreshold,
+        gyroThreshold,
+        audioRmsThreshold,
+        preTriggerSeconds,
+        postTriggerSeconds,
+        routeDeviationDistanceMeters,
+        routeDeviationDurationSeconds,
+        routePath,
+        sttEnabled: sttEngine !== STT_ENGINE_OFF,
+        sttEngine,
+        monitoringMode,
+        customPrompt,
+        ...overrides,
+      };
+    },
+    [
+      audioRmsThreshold,
+      customPrompt,
+      gyroThreshold,
+      monitoringMode,
+      postTriggerSeconds,
+      preTriggerSeconds,
+      routeDeviationDistanceMeters,
+      routeDeviationDurationSeconds,
+      safetyProfile.childRoutePath,
+      sensorThreshold,
+      sttEngine,
+    ],
+  );
 
   const refreshAudioLogs = useCallback(async () => {
     try {
@@ -396,6 +584,39 @@ function App() {
     setLocationPickerTarget(target);
   }, []);
 
+  const openManualRouteFlow = useCallback(() => {
+    if (!isKakaoKeyConfigured(KAKAO_MAP_JAVASCRIPT_KEY)) {
+      Alert.alert(
+        '카카오맵 JavaScript 키 필요',
+        'src/config/kakaoMap.ts의 KAKAO_MAP_JAVASCRIPT_KEY 값을 실제 키로 변경해 주세요.',
+      );
+      return;
+    }
+
+    console.log('[ManualRouteFlow] open');
+    setManualRouteInfoDraft(createRouteInfoDraft(`수동 경로 ${profileDraftRef.current.savedRoutes.length + 1}`));
+    setManualRouteInfoVisible(false);
+    setPendingManualRoutePath([]);
+    setRoutePickerPurpose('manualCreate');
+    setEditingSavedRouteId(null);
+    setManualRouteFlowPhase('start');
+    setRoutePickerMode('edit');
+    setProfileDraft(current => ({
+      ...current,
+      startLocation: null,
+      destinationLocation: null,
+      childRoutePath: [],
+    }));
+    setLocationPickerTarget('startLocation');
+  }, []);
+
+  const closeLocationPicker = useCallback(() => {
+    setLocationPickerTarget(null);
+    if (manualRouteFlowPhase !== 'idle') {
+      setManualRouteFlowPhase('idle');
+    }
+  }, []);
+
   const injectLocationPickerGeocodeResult = useCallback(
     (payload: {address?: string; latitude?: number; longitude?: number; error?: string}) => {
       locationPickerWebViewRef.current?.injectJavaScript(
@@ -469,6 +690,9 @@ function App() {
 
         if ('type' in payload && payload.type === 'close') {
           setLocationPickerTarget(null);
+          if (manualRouteFlowPhase !== 'idle') {
+            setManualRouteFlowPhase('idle');
+          }
           return;
         }
 
@@ -499,6 +723,34 @@ function App() {
           longitude: (payload as RoutineLocation).longitude,
           address: (payload as RoutineLocation).address,
         };
+        if (manualRouteFlowPhase === 'start' && locationPickerTarget === 'startLocation') {
+          console.log('[ManualRouteFlow] start selected', nextLocation);
+          setProfileDraft(current => ({
+            ...current,
+            startLocation: nextLocation,
+            destinationLocation: null,
+            childRoutePath: [],
+          }));
+          setLocationPickerTarget(null);
+          setManualRouteFlowPhase('destination');
+          setTimeout(() => setLocationPickerTarget('destinationLocation'), 0);
+          return;
+        }
+
+        if (manualRouteFlowPhase === 'destination' && locationPickerTarget === 'destinationLocation') {
+          console.log('[ManualRouteFlow] destination selected', nextLocation);
+          setProfileDraft(current => ({
+            ...current,
+            destinationLocation: nextLocation,
+            childRoutePath: [],
+          }));
+          setLocationPickerTarget(null);
+          setManualRouteFlowPhase('route');
+          setRoutePickerMode('edit');
+          setRoutePickerVisible(true);
+          return;
+        }
+
         setProfileDraft(current => ({
           ...current,
           [locationPickerTarget]: nextLocation,
@@ -512,13 +764,8 @@ function App() {
         );
       }
     },
-    [geocodeLocationPickerAddress, locationPickerTarget],
+    [geocodeLocationPickerAddress, locationPickerTarget, manualRouteFlowPhase],
   );
-
-  const openRoutePicker = useCallback(() => {
-    setRoutePickerMode(profileDraft.childRoutePath.length > 0 ? 'view' : 'edit');
-    setRoutePickerVisible(true);
-  }, [profileDraft.childRoutePath.length]);
 
   const handleRoutePickerMessage = useCallback((event: WebViewMessageEvent) => {
     try {
@@ -540,19 +787,118 @@ function App() {
         Alert.alert('\uACBD\uB85C \uC800\uC7A5 \uC2E4\uD328', '\uACBD\uB85C \uC88C\uD45C \uC751\uB2F5 \uD615\uC2DD\uC774 \uC62C\uBC14\uB974\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4.');
         return;
       }
+      const nextRoutePath = payload.childRoutePath;
 
+      if (routePickerPurpose === 'savedRouteEdit' && editingSavedRouteId) {
+        console.log('[SavedRouteEditor] waypoint save requested', {
+          routeId: editingSavedRouteId,
+          routePointCount: nextRoutePath.length,
+        });
+        setProfileDraft(current =>
+          updateSavedRouteInProfile(current, editingSavedRouteId, {
+            waypoints: nextRoutePath,
+          }),
+        );
+        setEditingSavedRouteId(null);
+        setRoutePickerPurpose(null);
+        setRoutePickerVisible(false);
+        return;
+      }
+
+      const latestProfileDraft = profileDraftRef.current;
+      console.log('[ManualRouteFlow] route save requested', {
+        phase: manualRouteFlowPhase,
+        routePointCount: nextRoutePath.length,
+        hasStartLocation: Boolean(latestProfileDraft.startLocation),
+        hasDestinationLocation: Boolean(latestProfileDraft.destinationLocation),
+        savedRouteCount: latestProfileDraft.savedRoutes.length,
+      });
+
+      if (!latestProfileDraft.startLocation || !latestProfileDraft.destinationLocation) {
+        console.warn('[ManualRouteFlow] route save blocked: missing endpoint', {
+          phase: manualRouteFlowPhase,
+          startLocation: latestProfileDraft.startLocation,
+          destinationLocation: latestProfileDraft.destinationLocation,
+        });
+        Alert.alert('경로 저장 실패', '출발지와 도착지를 먼저 선택해 주세요.');
+        return;
+      }
+      if (latestProfileDraft.savedRoutes.length >= MAX_SAVED_ROUTES) {
+        Alert.alert('경로 저장 한도', '저장 가능한 경로는 최대 5개입니다.');
+        return;
+      }
+
+      setPendingManualRoutePath(nextRoutePath);
       setProfileDraft(current => ({
         ...current,
-        childRoutePath: payload.childRoutePath ?? [],
+        childRoutePath: nextRoutePath,
       }));
       setRoutePickerVisible(false);
+      setManualRouteInfoVisible(true);
     } catch (error) {
       Alert.alert(
         '\uACBD\uB85C \uC800\uC7A5 \uC2E4\uD328',
         error instanceof Error ? error.message : String(error),
       );
     }
-  }, []);
+  }, [editingSavedRouteId, manualRouteFlowPhase, routePickerPurpose]);
+
+  const saveManualRouteInfo = useCallback(() => {
+    const latestProfileDraft = profileDraftRef.current;
+    if (!latestProfileDraft.startLocation || !latestProfileDraft.destinationLocation) {
+      Alert.alert('경로 저장 실패', '출발지와 도착지를 먼저 선택해 주세요.');
+      return;
+    }
+    if (latestProfileDraft.savedRoutes.length >= MAX_SAVED_ROUTES) {
+      Alert.alert('경로 저장 한도', '저장 가능한 경로는 최대 5개입니다.');
+      return;
+    }
+    if (pendingManualRoutePath.length < 2) {
+      Alert.alert('경로 저장 실패', '저장하려면 경로 지점을 2개 이상 선택해 주세요.');
+      return;
+    }
+
+    const routeInfo = normalizeRouteInfoDraft(
+      manualRouteInfoDraft,
+      `수동 경로 ${latestProfileDraft.savedRoutes.length + 1}`,
+    );
+    const nextRoute: SavedRoute = {
+      id: createRouteId(),
+      ...routeInfo,
+      isActive: true,
+      start: latestProfileDraft.startLocation,
+      end: latestProfileDraft.destinationLocation,
+      waypoints: pendingManualRoutePath,
+    };
+    console.log('[ManualRouteFlow] route save accepted', {
+      routeId: nextRoute.id,
+      routePointCount: nextRoute.waypoints.length,
+    });
+    setProfileDraft(current => addSavedRouteToProfile(current, nextRoute));
+    setManualRouteFlowPhase('idle');
+    setRoutePickerPurpose(null);
+    setManualRouteInfoVisible(false);
+    setPendingManualRoutePath([]);
+  }, [manualRouteInfoDraft, pendingManualRoutePath]);
+
+  const cancelManualRouteInfo = useCallback(() => {
+    setManualRouteInfoVisible(false);
+    if (routePickerPurpose === 'manualCreate' && manualRouteFlowPhase === 'route') {
+      setRoutePickerMode('edit');
+      setRoutePickerVisible(true);
+    }
+  }, [manualRouteFlowPhase, routePickerPurpose]);
+
+  const isMonitoring =
+    state.mode === 'warming' ||
+    state.mode === 'monitoring' ||
+    state.mode === 'analyzing' ||
+    state.mode === 'countdown';
+
+  const canStop =
+    state.mode === 'monitoring' ||
+    state.mode === 'analyzing' ||
+    state.mode === 'countdown';
 
   const saveSafetyProfile = useCallback(async () => {
     if (!profileDraft.mode) {
@@ -560,7 +906,7 @@ function App() {
       return;
     }
 
-    const nextProfile = {
+    const nextProfile = normalizeSafetyProfile({
       ...profileDraft,
       birthday: profileDraft.birthday.trim(),
       gender: profileDraft.gender.trim(),
@@ -570,30 +916,60 @@ function App() {
       startMinute: profileDraft.startMinute.trim(),
       destinationHour: profileDraft.destinationHour.trim(),
       destinationMinute: profileDraft.destinationMinute.trim(),
-    };
+      savedRoutes: profileDraft.savedRoutes.map(route => ({
+        ...route,
+        ...normalizeRouteInfoDraft(route, route.name),
+      })),
+    });
+    if (!nextProfile.birthday || !parseBirthday(nextProfile.birthday)) {
+      Alert.alert('생일 입력 필요', '유효한 생일을 입력해 주세요.');
+      return;
+    }
+    if (!nextProfile.emergencyPhone) {
+      Alert.alert('비상 전화번호 입력 필요', '비상 전화번호를 입력해 주세요.');
+      return;
+    }
+    if (!nextProfile.detailAddress) {
+      Alert.alert('상세 주소 입력 필요', '상세 주소를 입력해 주세요.');
+      return;
+    }
     setSafetyProfile(nextProfile);
     setProfileDraft(nextProfile);
     setMonitoringMode(nextProfile.mode ?? 'adult');
     await saveSettings({
       sttEngine,
+      sirenEnabled,
       customPrompt,
+      sensorThreshold,
+      gyroThreshold,
       audioRmsThreshold,
+      preTriggerSeconds,
+      postTriggerSeconds,
+      routeDeviationDistanceMeters,
+      routeDeviationDurationSeconds,
       safetyProfile: nextProfile,
     });
+    if (isMonitoring) {
+      try {
+        setRouteDeviationStatus(null);
+        await EmergencyNative.startMonitoring(
+          buildMonitoringConfig({
+            monitoringMode: nextProfile.mode ?? 'adult',
+            routePath: nextProfile.childRoutePath.length >= 2 ? nextProfile.childRoutePath : [],
+          }),
+        );
+      } catch (error) {
+        console.warn('[RouteDeviation] saveSafetyProfile route refresh failed', error);
+      }
+    }
     setProfileEditorVisible(false);
-  }, [audioRmsThreshold, customPrompt, profileDraft, saveSettings, sttEngine]);
+  }, [audioRmsThreshold, buildMonitoringConfig, customPrompt, gyroThreshold, isMonitoring, postTriggerSeconds, preTriggerSeconds, profileDraft, routeDeviationDistanceMeters, routeDeviationDurationSeconds, saveSettings, sensorThreshold, sirenEnabled, sttEngine]);
   const startMonitoring = useCallback(async () => {
     try {
+      setRouteDeviationStatus(null);
       dispatch({type: 'START_REQUESTED'});
       await requestAndroidPermissions();
-      const config = {
-        ...baseMonitoringConfig,
-        audioRmsThreshold,
-        sttEnabled: sttEngine !== STT_ENGINE_OFF,
-        sttEngine,
-        monitoringMode,
-        customPrompt,
-      };
+      const config = buildMonitoringConfig();
       const warmUpStatus = await MlcGemmaNative.warmUp(config.modelId);
       console.log('[EmergencyDebug] warmUp', warmUpStatus);
       await EmergencyNative.startMonitoring(config);
@@ -603,10 +979,13 @@ function App() {
         message: error instanceof Error ? error.message : '시작 실패',
       });
     }
-  }, [audioRmsThreshold, customPrompt, monitoringMode, sttEngine]);
+  }, [buildMonitoringConfig]);
 
   const stopMonitoring = useCallback(async () => {
     await EmergencyNative.stopMonitoring();
+    setRouteDeviationStatus(null);
+    setRouteStatusVisible(false);
+    setRouteStatusLocation(null);
     dispatch({type: 'RESET'});
   }, []);
 
@@ -633,23 +1012,182 @@ function App() {
   const closeRoutePicker = useCallback(() => {
     setRoutePickerVisible(false);
     setRoutePickerMode('edit');
+    setRoutePickerPurpose(null);
+    setEditingSavedRouteId(null);
+    setManualRouteInfoVisible(false);
+    setPendingManualRoutePath([]);
+    if (manualRouteFlowPhase === 'route') {
+      setManualRouteFlowPhase('idle');
+    }
+  }, [manualRouteFlowPhase]);
+
+  const closeRouteAutoCapture = useCallback(async () => {
+    if (routeCapturePhase === 'collecting') {
+      await EmergencyNative.stopRouteCapture().catch(() => undefined);
+    }
+    setRouteCaptureVisible(false);
+    setRouteCapturePhase('confirm');
+    setRouteCaptureStart(null);
+    setRouteCaptureEnd(null);
+    setRouteCaptureWaypoints([]);
+    setRouteCaptureInfoDraft(createRouteInfoDraft());
+  }, [routeCapturePhase]);
+
+  const openRouteAutoCapture = useCallback(async () => {
+    if (!isKakaoKeyConfigured(KAKAO_MAP_JAVASCRIPT_KEY)) {
+      Alert.alert(
+        '카카오맵 JavaScript 키 필요',
+        'src/config/kakaoMap.ts의 KAKAO_MAP_JAVASCRIPT_KEY 값을 실제 키로 변경해 주세요.',
+      );
+      return;
+    }
+
+    try {
+      await requestAndroidLocationPermissions();
+      const currentLocation = await EmergencyNative.getCurrentLocation();
+      const startLocation = routePointToRoutineLocation(
+        currentLocation,
+        '자동 수집 출발지',
+      );
+      setRouteCaptureInfoDraft(createRouteInfoDraft(`자동 경로 ${profileDraft.savedRoutes.length + 1}`));
+      setRouteCaptureStart(startLocation);
+      setRouteCaptureEnd(null);
+      setRouteCaptureWaypoints([currentLocation]);
+      setRouteCapturePhase('confirm');
+      setRouteCaptureVisible(true);
+    } catch (error) {
+      Alert.alert(
+        '현재 위치 확인 실패',
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }, [profileDraft.savedRoutes.length]);
+
+  const startRouteAutoCapture = useCallback(async () => {
+    if (!routeCaptureStart) {
+      return;
+    }
+    try {
+      await EmergencyNative.startRouteCapture(routeCaptureStart);
+      setRouteCaptureWaypoints([routeCaptureStart]);
+      setRouteCapturePhase('collecting');
+    } catch (error) {
+      Alert.alert(
+        '경로 자동 수집 시작 실패',
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }, [routeCaptureStart]);
+
+  const stopRouteAutoCapture = useCallback(async () => {
+    try {
+      const result = await EmergencyNative.stopRouteCapture();
+      const startLocation = routePointToRoutineLocation(result.start, '자동 수집 출발지');
+      const endLocation = routePointToRoutineLocation(result.end, '자동 수집 목적지');
+      setRouteCaptureStart(startLocation);
+      setRouteCaptureEnd(endLocation);
+      setRouteCaptureWaypoints(normalizeRoutePath(result.waypoints));
+      setRouteCapturePhase('review');
+    } catch (error) {
+      Alert.alert(
+        '경로 자동 수집 종료 실패',
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }, [profileDraft.destinationLocation, profileDraft.savedRoutes.length, profileDraft.startLocation]);
+
+  const handleRouteAutoCaptureMessage = useCallback((event: WebViewMessageEvent) => {
+    try {
+      const payload = JSON.parse(event.nativeEvent.data) as
+        | {type: 'routeEdited'; waypoints?: RoutePathPoint[]; end?: RoutePathPoint}
+        | {type: 'routeStartAdjusted'; start?: RoutePathPoint}
+        | {error?: string};
+      if ('error' in payload && payload.error) {
+        Alert.alert('경로 편집 오류', payload.error);
+        return;
+      }
+      if ('type' in payload && payload.type === 'routeStartAdjusted' && payload.start) {
+        const startLocation = routePointToRoutineLocation(payload.start, '자동 수집 출발지');
+        setRouteCaptureStart(startLocation);
+        setRouteCaptureWaypoints([payload.start]);
+        return;
+      }
+      if ('type' in payload && payload.type === 'routeEdited') {
+        setRouteCaptureWaypoints(normalizeRoutePath(payload.waypoints));
+        if (payload.end) {
+          setRouteCaptureEnd(routePointToRoutineLocation(payload.end, '자동 수집 목적지'));
+        }
+      }
+    } catch (error) {
+      Alert.alert(
+        '경로 편집 오류',
+        error instanceof Error ? error.message : String(error),
+      );
+    }
   }, []);
 
+  const saveAutoCapturedRoute = useCallback(() => {
+    if (!routeCaptureStart || !routeCaptureEnd) {
+      Alert.alert('경로 저장 실패', '출발지와 도착지 좌표가 필요합니다.');
+      return;
+    }
+    if (profileDraft.savedRoutes.length >= MAX_SAVED_ROUTES) {
+      Alert.alert('경로 저장 한도', '저장 가능한 경로는 최대 5개입니다.');
+      return;
+    }
+
+    const routeInfo = normalizeRouteInfoDraft(
+      routeCaptureInfoDraft,
+      `자동 경로 ${profileDraft.savedRoutes.length + 1}`,
+    );
+    const nextRoute: SavedRoute = {
+      id: createRouteId(),
+      ...routeInfo,
+      isActive: true,
+      start: routeCaptureStart,
+      end: routeCaptureEnd,
+      waypoints: routeCaptureWaypoints,
+    };
+
+    setProfileDraft(current => addSavedRouteToProfile(current, nextRoute));
+    setRouteCaptureVisible(false);
+    setRouteCapturePhase('confirm');
+    setRouteCaptureInfoDraft(createRouteInfoDraft());
+  }, [
+    profileDraft.savedRoutes.length,
+    routeCaptureEnd,
+    routeCaptureInfoDraft,
+    routeCaptureStart,
+    routeCaptureWaypoints,
+  ]);
+
   const handleRouteBack = useCallback(() => {
-    if (routePickerMode === 'edit' && profileDraft.childRoutePath.length > 0) {
+    if (
+      routePickerPurpose !== 'savedRouteEdit' &&
+      routePickerMode === 'edit' &&
+      profileDraft.childRoutePath.length > 0
+    ) {
       setRoutePickerMode('view');
       return;
     }
     closeRoutePicker();
-  }, [closeRoutePicker, profileDraft.childRoutePath.length, routePickerMode]);
+  }, [closeRoutePicker, profileDraft.childRoutePath.length, routePickerMode, routePickerPurpose]);
 
   const handleHardwareBack = useCallback(() => {
     if (locationPickerTarget) {
-      setLocationPickerTarget(null);
+      closeLocationPicker();
       return true;
     }
     if (routePickerVisible) {
       handleRouteBack();
+      return true;
+    }
+    if (manualRouteInfoVisible) {
+      cancelManualRouteInfo();
+      return true;
+    }
+    if (routeCaptureVisible) {
+      closeRouteAutoCapture().catch(() => undefined);
       return true;
     }
     if (promptEditorVisible) {
@@ -693,14 +1231,19 @@ function App() {
     audioLogsVisible,
     cancelReport,
     closeAudioLogs,
+    closeLocationPicker,
     closeProfileEditor,
+    closeRouteAutoCapture,
+    cancelManualRouteInfo,
     handleRouteBack,
     locationPickerTarget,
     logsVisible,
+    manualRouteInfoVisible,
     menuVisible,
     profileEditorVisible,
     promptEditorVisible,
     routePickerVisible,
+    routeCaptureVisible,
     settingsVisible,
     state.mode,
   ]);
@@ -724,40 +1267,129 @@ function App() {
     }
   }, []);
 
-  const isMonitoring =
-    state.mode === 'warming' ||
-    state.mode === 'monitoring' ||
-    state.mode === 'analyzing' ||
-    state.mode === 'countdown';
-
-  const canStop =
-    state.mode === 'monitoring' ||
-    state.mode === 'analyzing' ||
-    state.mode === 'countdown';
-
   const updateSttEngine = useCallback(
     async (nextEngine: SttEngine) => {
       setSttEngine(nextEngine);
-      await saveSettings({sttEngine: nextEngine, customPrompt, audioRmsThreshold, safetyProfile});
+      await saveSettings({
+        sttEngine: nextEngine,
+        sirenEnabled,
+        customPrompt,
+        sensorThreshold,
+        gyroThreshold,
+        audioRmsThreshold,
+        preTriggerSeconds,
+        postTriggerSeconds,
+        routeDeviationDistanceMeters,
+        routeDeviationDurationSeconds,
+        safetyProfile,
+      });
       if (!isMonitoring) {
         return;
       }
 
       try {
-        await EmergencyNative.startMonitoring({
-          ...baseMonitoringConfig,
-          audioRmsThreshold,
-          sttEnabled: nextEngine !== STT_ENGINE_OFF,
-          sttEngine: nextEngine,
-          monitoringMode,
-          customPrompt,
-        });
+        await EmergencyNative.startMonitoring(
+          buildMonitoringConfig({
+            sttEnabled: nextEngine !== STT_ENGINE_OFF,
+            sttEngine: nextEngine,
+          }),
+        );
       } catch (error) {
         console.warn('[EmergencyDebug] updateSttEngine failed', error);
       }
     },
-    [audioRmsThreshold, customPrompt, isMonitoring, monitoringMode, safetyProfile, saveSettings],
+    [audioRmsThreshold, buildMonitoringConfig, customPrompt, gyroThreshold, isMonitoring, postTriggerSeconds, preTriggerSeconds, routeDeviationDistanceMeters, routeDeviationDurationSeconds, safetyProfile, saveSettings, sensorThreshold, sirenEnabled],
   );
+  const updateSirenEnabled = useCallback(
+    async (enabled: boolean) => {
+      setSirenEnabled(enabled);
+      await saveSettings({
+        sttEngine,
+        sirenEnabled: enabled,
+        customPrompt,
+        sensorThreshold,
+        gyroThreshold,
+        audioRmsThreshold,
+        preTriggerSeconds,
+        postTriggerSeconds,
+        routeDeviationDistanceMeters,
+        routeDeviationDurationSeconds,
+        safetyProfile,
+      });
+      if (!enabled && state.mode === 'countdown') {
+        EmergencyNative.stopSiren().catch(() => undefined);
+      }
+    },
+    [audioRmsThreshold, customPrompt, gyroThreshold, postTriggerSeconds, preTriggerSeconds, routeDeviationDistanceMeters, routeDeviationDurationSeconds, safetyProfile, saveSettings, sensorThreshold, state.mode, sttEngine],
+  );
+  const activateSavedRoute = useCallback(
+    async (routeId: string) => {
+      const nextProfile = activateRouteInProfile(safetyProfile, routeId);
+      setSafetyProfile(nextProfile);
+      setProfileDraft(nextProfile);
+      await saveSettings({
+        sttEngine,
+        sirenEnabled,
+        customPrompt,
+        sensorThreshold,
+        gyroThreshold,
+        audioRmsThreshold,
+        preTriggerSeconds,
+        postTriggerSeconds,
+        routeDeviationDistanceMeters,
+        routeDeviationDurationSeconds,
+        safetyProfile: nextProfile,
+      });
+      if (isMonitoring) {
+        try {
+          setRouteDeviationStatus(null);
+          setRouteStatusVisible(false);
+          setRouteStatusLocation(null);
+          await EmergencyNative.startMonitoring(
+            buildMonitoringConfig({
+              routePath: nextProfile.childRoutePath.length >= 2 ? nextProfile.childRoutePath : [],
+            }),
+          );
+        } catch (error) {
+          console.warn('[RouteDeviation] activateSavedRoute refresh failed', error);
+        }
+      }
+    },
+    [audioRmsThreshold, buildMonitoringConfig, customPrompt, gyroThreshold, isMonitoring, postTriggerSeconds, preTriggerSeconds, routeDeviationDistanceMeters, routeDeviationDurationSeconds, safetyProfile, saveSettings, sensorThreshold, sirenEnabled, sttEngine],
+  );
+  const updateProfileDraftRoute = useCallback(
+    (routeId: string, updates: Partial<SavedRoute>) => {
+      setProfileDraft(current => updateSavedRouteInProfile(current, routeId, updates));
+    },
+    [],
+  );
+  const activateProfileDraftRoute = useCallback((routeId: string) => {
+    setProfileDraft(current => activateRouteInProfile(current, routeId));
+  }, []);
+  const deleteProfileDraftRoute = useCallback((routeId: string) => {
+    const route = profileDraftRef.current.savedRoutes.find(savedRoute => savedRoute.id === routeId);
+    if (!route) {
+      return;
+    }
+    Alert.alert(
+      '경로 삭제',
+      `'${route.name}' 경로를 삭제할까요?`,
+      [
+        {text: '취소', style: 'cancel'},
+        {
+          text: '삭제',
+          style: 'destructive',
+          onPress: () => setProfileDraft(current => deleteSavedRouteFromProfile(current, routeId)),
+        },
+      ],
+    );
+  }, []);
+  const openSavedRouteWaypointEditor = useCallback((routeId: string) => {
+    setEditingSavedRouteId(routeId);
+    setRoutePickerPurpose('savedRouteEdit');
+    setRoutePickerMode('edit');
+    setRoutePickerVisible(true);
+  }, []);
   const updateAudioRmsThreshold = useCallback(async () => {
     const parsed = Number(audioRmsThresholdInput);
     if (!Number.isFinite(parsed) || parsed <= 0 || parsed > 1) {
@@ -771,8 +1403,15 @@ function App() {
     setAudioRmsThresholdInput(String(nextThreshold));
     await saveSettings({
       sttEngine,
+      sirenEnabled,
       customPrompt,
+      sensorThreshold,
+      gyroThreshold,
       audioRmsThreshold: nextThreshold,
+      preTriggerSeconds,
+      postTriggerSeconds,
+      routeDeviationDistanceMeters,
+      routeDeviationDurationSeconds,
       safetyProfile,
     });
 
@@ -781,27 +1420,344 @@ function App() {
     }
 
     try {
-      await EmergencyNative.startMonitoring({
-        ...baseMonitoringConfig,
-        audioRmsThreshold: nextThreshold,
-        sttEnabled: sttEngine !== STT_ENGINE_OFF,
-        sttEngine,
-        monitoringMode,
-        customPrompt,
-      });
+      await EmergencyNative.startMonitoring(
+        buildMonitoringConfig({audioRmsThreshold: nextThreshold}),
+      );
     } catch (error) {
       console.warn('[EmergencyDebug] updateAudioRmsThreshold failed', error);
     }
   }, [
     audioRmsThreshold,
     audioRmsThresholdInput,
+    buildMonitoringConfig,
     customPrompt,
+    gyroThreshold,
     isMonitoring,
-    monitoringMode,
+    postTriggerSeconds,
+    preTriggerSeconds,
+    routeDeviationDistanceMeters,
+    routeDeviationDurationSeconds,
     safetyProfile,
     saveSettings,
+    sensorThreshold,
+    sirenEnabled,
     sttEngine,
   ]);
+  const updateAnalysisWindowSeconds = useCallback(
+    async (target: 'pre' | 'post', value: number) => {
+      const nextValue = normalizeAnalysisWindowSeconds(value, target === 'pre' ? preTriggerSeconds : postTriggerSeconds);
+      const nextPreTriggerSeconds = target === 'pre' ? nextValue : preTriggerSeconds;
+      const nextPostTriggerSeconds = target === 'post' ? nextValue : postTriggerSeconds;
+
+      if (
+        nextPreTriggerSeconds === preTriggerSeconds &&
+        nextPostTriggerSeconds === postTriggerSeconds
+      ) {
+        return;
+      }
+
+      setPreTriggerSeconds(nextPreTriggerSeconds);
+      setPostTriggerSeconds(nextPostTriggerSeconds);
+      await saveSettings({
+        sttEngine,
+        sirenEnabled,
+        customPrompt,
+        sensorThreshold,
+        gyroThreshold,
+        audioRmsThreshold,
+        preTriggerSeconds: nextPreTriggerSeconds,
+        postTriggerSeconds: nextPostTriggerSeconds,
+        routeDeviationDistanceMeters,
+        routeDeviationDurationSeconds,
+        safetyProfile,
+      });
+
+      if (!isMonitoring) {
+        return;
+      }
+
+      try {
+        await EmergencyNative.startMonitoring(
+          buildMonitoringConfig({
+            preTriggerSeconds: nextPreTriggerSeconds,
+            postTriggerSeconds: nextPostTriggerSeconds,
+          }),
+        );
+      } catch (error) {
+        console.warn('[EmergencyDebug] updateAnalysisWindowSeconds failed', error);
+      }
+    },
+    [
+      audioRmsThreshold,
+      buildMonitoringConfig,
+      customPrompt,
+      gyroThreshold,
+      isMonitoring,
+      postTriggerSeconds,
+      preTriggerSeconds,
+      routeDeviationDistanceMeters,
+      routeDeviationDurationSeconds,
+      safetyProfile,
+      saveSettings,
+      sensorThreshold,
+      sirenEnabled,
+      sttEngine,
+    ],
+  );
+  const applyMotionSensorThresholds = useCallback(async (
+    nextSensorThreshold: number,
+    nextGyroThreshold: number,
+  ) => {
+    setSensorThreshold(nextSensorThreshold);
+    setGyroThreshold(nextGyroThreshold);
+    await saveSettings({
+      sttEngine,
+      sirenEnabled,
+      customPrompt,
+      sensorThreshold: nextSensorThreshold,
+      gyroThreshold: nextGyroThreshold,
+      audioRmsThreshold,
+      preTriggerSeconds,
+      postTriggerSeconds,
+      routeDeviationDistanceMeters,
+      routeDeviationDurationSeconds,
+      safetyProfile,
+    });
+
+    if (!isMonitoring) {
+      return;
+    }
+
+    try {
+      await EmergencyNative.startMonitoring(
+        buildMonitoringConfig({
+          sensorThreshold: nextSensorThreshold,
+          gyroThreshold: nextGyroThreshold,
+        }),
+      );
+    } catch (error) {
+      console.warn('[EmergencyDebug] applyMotionSensorThresholds failed', error);
+    }
+  }, [
+    audioRmsThreshold,
+    buildMonitoringConfig,
+    customPrompt,
+    isMonitoring,
+    postTriggerSeconds,
+    preTriggerSeconds,
+    routeDeviationDistanceMeters,
+    routeDeviationDurationSeconds,
+    safetyProfile,
+    saveSettings,
+    sirenEnabled,
+    sttEngine,
+  ]);
+  const updateSensorThresholdInput = useCallback(
+    (value: string) => {
+      const digits = value.replace(/\D/g, '');
+      setSensorThresholdInput(digits);
+      const parsed = parsePositiveInteger(digits);
+      if (parsed) {
+        applyMotionSensorThresholds(parsed, gyroThreshold).catch(() => undefined);
+      }
+    },
+    [applyMotionSensorThresholds, gyroThreshold],
+  );
+  const updateGyroThresholdInput = useCallback(
+    (value: string) => {
+      const digits = value.replace(/\D/g, '');
+      setGyroThresholdInput(digits);
+      const parsed = parsePositiveInteger(digits);
+      if (parsed) {
+        applyMotionSensorThresholds(sensorThreshold, parsed).catch(() => undefined);
+      }
+    },
+    [applyMotionSensorThresholds, sensorThreshold],
+  );
+  const resetMotionSensorThresholds = useCallback(async () => {
+    setSensorThresholdInput(String(DEFAULT_SENSOR_THRESHOLD));
+    setGyroThresholdInput(String(DEFAULT_GYRO_THRESHOLD));
+    await applyMotionSensorThresholds(
+      DEFAULT_SENSOR_THRESHOLD,
+      DEFAULT_GYRO_THRESHOLD,
+    );
+  }, [applyMotionSensorThresholds]);
+  const applyRouteDeviationSettings = useCallback(async (
+    nextDistanceMeters: number,
+    nextDurationSeconds: number,
+  ) => {
+    setRouteDeviationDistanceMeters(nextDistanceMeters);
+    setRouteDeviationDurationSeconds(nextDurationSeconds);
+    await saveSettings({
+      sttEngine,
+      sirenEnabled,
+      customPrompt,
+      sensorThreshold,
+      gyroThreshold,
+      audioRmsThreshold,
+      preTriggerSeconds,
+      postTriggerSeconds,
+      routeDeviationDistanceMeters: nextDistanceMeters,
+      routeDeviationDurationSeconds: nextDurationSeconds,
+      safetyProfile,
+    });
+
+    if (!isMonitoring) {
+      return;
+    }
+
+    try {
+      await EmergencyNative.startMonitoring(
+        buildMonitoringConfig({
+          routeDeviationDistanceMeters: nextDistanceMeters,
+          routeDeviationDurationSeconds: nextDurationSeconds,
+        }),
+      );
+    } catch (error) {
+      console.warn('[RouteDeviation] applyRouteDeviationSettings failed', error);
+    }
+  }, [
+    audioRmsThreshold,
+    buildMonitoringConfig,
+    customPrompt,
+    gyroThreshold,
+    isMonitoring,
+    postTriggerSeconds,
+    preTriggerSeconds,
+    safetyProfile,
+    saveSettings,
+    sensorThreshold,
+    sirenEnabled,
+    sttEngine,
+  ]);
+  const updateRouteDeviationDistanceInput = useCallback(
+    (value: string) => {
+      const digits = value.replace(/\D/g, '');
+      setRouteDeviationDistanceInput(digits);
+      const parsed = parsePositiveInteger(digits);
+      if (parsed) {
+        applyRouteDeviationSettings(parsed, routeDeviationDurationSeconds).catch(() => undefined);
+      }
+    },
+    [applyRouteDeviationSettings, routeDeviationDurationSeconds],
+  );
+  const updateRouteDeviationDurationInput = useCallback(
+    (value: string) => {
+      const digits = value.replace(/\D/g, '');
+      setRouteDeviationDurationInput(digits);
+      const parsed = parsePositiveInteger(digits);
+      if (parsed) {
+        applyRouteDeviationSettings(routeDeviationDistanceMeters, parsed).catch(() => undefined);
+      }
+    },
+    [applyRouteDeviationSettings, routeDeviationDistanceMeters],
+  );
+  const currentRouteStatusText = routeDeviationStatus?.route_deviation ? '경로 이탈' : '경로 일치';
+  const loadRouteStatusLocation = useCallback(async () => {
+    const currentLocation = await EmergencyNative.getCurrentLocation();
+    const headingResult =
+      typeof EmergencyNative.getCurrentHeading === 'function'
+        ? await EmergencyNative.getCurrentHeading().catch(() => undefined)
+        : undefined;
+    return {
+      ...currentLocation,
+      heading: headingResult?.heading ?? currentLocation.heading,
+    };
+  }, []);
+  const openRouteStatusModal = useCallback(async () => {
+    if (!isKakaoKeyConfigured(KAKAO_MAP_JAVASCRIPT_KEY)) {
+      Alert.alert(
+        '카카오맵 JavaScript 키 필요',
+        'src/config/kakaoMap.ts의 KAKAO_MAP_JAVASCRIPT_KEY 값을 실제 키로 변경해 주세요.',
+      );
+      return;
+    }
+    if (!safetyProfile.startLocation || !safetyProfile.destinationLocation || safetyProfile.childRoutePath.length < 2) {
+      Alert.alert('경로 확인 불가', '현재 활성화된 경로가 없습니다.');
+      return;
+    }
+
+    try {
+      await requestAndroidLocationPermissions();
+      const nextLocation = await loadRouteStatusLocation();
+      setRouteStatusLocation(nextLocation);
+      setRouteStatusMapStatusText(currentRouteStatusText);
+      setRouteStatusMapVersion(version => version + 1);
+      setRouteStatusVisible(true);
+    } catch (error) {
+      Alert.alert(
+        '현재 위치 확인 실패',
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }, [currentRouteStatusText, loadRouteStatusLocation, safetyProfile.childRoutePath.length, safetyProfile.destinationLocation, safetyProfile.startLocation]);
+
+  useEffect(() => {
+    if (!routeStatusVisible || !emergencyEvents) {
+      return;
+    }
+
+    const subscription = emergencyEvents.addListener('routeStatusLocation', event => {
+      const nextLocation = normalizeEmergencyLocation(event);
+      if (!nextLocation) {
+        return;
+      }
+      routeStatusWebViewRef.current?.injectJavaScript(
+        `window.updateCurrentLocation && window.updateCurrentLocation(${JSON.stringify(nextLocation)}); true;`,
+      );
+    });
+
+    EmergencyNative.startRouteStatusUpdates().catch(error => {
+      console.warn('[RouteStatus] start updates failed', error);
+    });
+
+    return () => {
+      subscription.remove();
+      EmergencyNative.stopRouteStatusUpdates().catch(error => {
+        console.warn('[RouteStatus] stop updates failed', error);
+      });
+    };
+  }, [routeStatusVisible]);
+
+  useEffect(() => {
+    if (!routeStatusVisible) {
+      return;
+    }
+
+    routeStatusWebViewRef.current?.injectJavaScript(
+      `window.updateRouteStatus && window.updateRouteStatus(${JSON.stringify(currentRouteStatusText)}); true;`,
+    );
+  }, [currentRouteStatusText, routeStatusVisible]);
+  const editingSavedRoute =
+    routePickerPurpose === 'savedRouteEdit' && editingSavedRouteId
+      ? profileDraft.savedRoutes.find(route => route.id === editingSavedRouteId)
+      : undefined;
+  const routePickerStartLocation = editingSavedRoute?.start ?? profileDraft.startLocation;
+  const routePickerDestinationLocation = editingSavedRoute?.end ?? profileDraft.destinationLocation;
+  const routePickerPath =
+    editingSavedRoute?.waypoints ??
+    (routePickerPurpose === 'manualCreate' && pendingManualRoutePath.length > 0
+      ? pendingManualRoutePath
+      : profileDraft.childRoutePath);
+  const routePickerKey = editingSavedRoute?.id ?? routePickerPurpose ?? 'profile-draft';
+  const hasActiveRouteForStatus =
+    Boolean(safetyProfile.startLocation) &&
+    Boolean(safetyProfile.destinationLocation) &&
+    safetyProfile.childRoutePath.length >= 2;
+  const showRouteStatusBadge = isMonitoring && hasActiveRouteForStatus && routeDeviationStatus !== null;
+  const routeStatusLabel = currentRouteStatusText;
+  const routeDeviationBadgeStyle =
+    routeDeviationStatus?.route_deviation && monitoringMode === 'child'
+      ? styles.routeDeviationBadgeChild
+      : routeDeviationStatus?.route_deviation
+        ? styles.routeDeviationBadgeAdult
+        : styles.routeDeviationBadgeMatched;
+  const routeStatusBadgeButtonStyle =
+    routeDeviationStatus?.route_deviation && monitoringMode === 'child'
+      ? styles.routeDeviationBadgeButtonChild
+      : routeDeviationStatus?.route_deviation
+        ? styles.routeDeviationBadgeButtonAdult
+        : styles.routeDeviationBadgeButtonMatched;
   if (!settingsLoaded) {
     return (
       <SafeAreaView style={styles.safeArea}>
@@ -823,8 +1779,13 @@ function App() {
             subtitle="유아/성인 모드와 귀가 루틴 정보를 먼저 저장합니다. 저장 후 기존 감시 화면으로 이동합니다."
             profile={profileDraft}
             onChange={updateProfileDraft}
-            onPickLocation={openLocationPicker}
-            onOpenRoutePicker={openRoutePicker}
+            kakaoKey={KAKAO_MAP_JAVASCRIPT_KEY}
+            onOpenRouteAutoCapture={openRouteAutoCapture}
+            onOpenManualRouteFlow={openManualRouteFlow}
+            onUpdateRoute={updateProfileDraftRoute}
+            onActivateRoute={activateProfileDraftRoute}
+            onEditRouteWaypoints={openSavedRouteWaypointEditor}
+            onDeleteRoute={deleteProfileDraftRoute}
             onSave={saveSafetyProfile}
             saveLabel="저장하고 시작"
           />
@@ -833,19 +1794,45 @@ function App() {
           visible={locationPickerTarget !== null}
           kakaoKey={KAKAO_MAP_JAVASCRIPT_KEY}
           webViewRef={locationPickerWebViewRef}
-          onClose={() => setLocationPickerTarget(null)}
+          onClose={closeLocationPicker}
           onMessage={handleLocationPickerMessage}
         />
         <RoutePickerModal
           visible={routePickerVisible}
           kakaoKey={KAKAO_MAP_JAVASCRIPT_KEY}
-          startLocation={profileDraft.startLocation}
-          destinationLocation={profileDraft.destinationLocation}
-          routePath={profileDraft.childRoutePath}
+          routeKey={routePickerKey}
+          startLocation={routePickerStartLocation}
+          destinationLocation={routePickerDestinationLocation}
+          routePath={routePickerPath}
           mode={routePickerMode}
-          onClose={closeRoutePicker}
           onBack={handleRouteBack}
           onMessage={handleRoutePickerMessage}
+        />
+        <ManualRouteInfoModal
+          visible={manualRouteInfoVisible}
+          draft={manualRouteInfoDraft}
+          onChange={(key, value) =>
+            setManualRouteInfoDraft(current => ({...current, [key]: value}))
+          }
+          onCancel={cancelManualRouteInfo}
+          onSave={saveManualRouteInfo}
+        />
+        <RouteAutoCaptureModal
+          visible={routeCaptureVisible}
+          kakaoKey={KAKAO_MAP_JAVASCRIPT_KEY}
+          phase={routeCapturePhase}
+          startLocation={routeCaptureStart}
+          endLocation={routeCaptureEnd}
+          waypoints={routeCaptureWaypoints}
+          routeInfoDraft={routeCaptureInfoDraft}
+          onRouteInfoChange={(key, value) =>
+            setRouteCaptureInfoDraft(current => ({...current, [key]: value}))
+          }
+          onStartCapture={startRouteAutoCapture}
+          onStopCapture={stopRouteAutoCapture}
+          onSaveRoute={saveAutoCapturedRoute}
+          onClose={closeRouteAutoCapture}
+          onMessage={handleRouteAutoCaptureMessage}
         />
       </SafeAreaView>
     );
@@ -869,11 +1856,23 @@ function App() {
         </View>
 
         <View style={styles.statusPanel}>
+          {showRouteStatusBadge ? (
+            <Pressable
+              style={[styles.routeDeviationBadgeButton, routeStatusBadgeButtonStyle]}
+              hitSlop={8}
+              onPress={openRouteStatusModal}>
+              <Text style={[styles.routeDeviationBadge, routeDeviationBadgeStyle]}>
+                {routeStatusLabel}
+              </Text>
+            </Pressable>
+          ) : null}
           <Text style={styles.statusLabel}>현재 상태</Text>
-          <Text style={styles.statusValue}>{statusText(state.mode)}</Text>
+          <Text style={styles.statusValue}>
+            {statusText(state.mode, state.analysisPass)}
+          </Text>
           <Text style={styles.summary}>{monitoringModeLabel(monitoringMode)}</Text>
-          {state.analysis ? (
-            <Text style={styles.summary}>{state.analysis.situation_summary}</Text>
+          {formatAnalysisSummary(state.analysis) ? (
+            <Text style={styles.summary}>{formatAnalysisSummary(state.analysis)}</Text>
           ) : null}
           {state.error ? <Text style={styles.error}>{state.error}</Text> : null}
         </View>
@@ -906,9 +1905,11 @@ function App() {
             <Text style={styles.modalTitle}>
               {state.countdown}초 후 경찰에 자동 신고됩니다
             </Text>
-            <Text style={styles.modalSummary}>
-              {state.analysis?.situation_summary}
-            </Text>
+            {formatAnalysisSummary(state.analysis) ? (
+              <Text style={styles.modalSummary}>
+                {formatAnalysisSummary(state.analysis)}
+              </Text>
+            ) : null}
             <Pressable style={styles.cancelButton} onPress={cancelReport}>
               <Text style={styles.cancelButtonText}>신고 취소</Text>
             </Pressable>
@@ -943,6 +1944,15 @@ function App() {
             </Pressable>
             <Pressable
               style={styles.menuOption}
+              onPress={() => {
+                setMenuVisible(false);
+                setProfileDraft(safetyProfile);
+                setProfileEditorVisible(true);
+              }}>
+              <Text style={styles.menuOptionText}>개인 정보 수정</Text>
+            </Pressable>
+            <Pressable
+              style={styles.menuOption}
               onPress={openGemmaPromptEditor}>
               <Text style={styles.menuOptionText}>{'\uD504\uB86C\uD504\uD2B8 \uC218\uC815'}</Text>
             </Pressable>
@@ -957,37 +1967,155 @@ function App() {
 
       <Modal visible={settingsVisible} transparent animationType="fade" onRequestClose={() => setSettingsVisible(false)}>
         <View style={styles.modalBackdrop}>
-          <View style={styles.menuCard}>
-            <Text style={styles.menuTitle}>설정</Text>
-            <View style={styles.settingRow}>
-              <View style={styles.settingTextGroup}>
-                <Text style={styles.settingLabel}>STT 기능</Text>
+          <View style={[styles.menuCard, styles.settingsCard]}>
+            <ScrollView
+              contentContainerStyle={styles.settingsScrollContent}
+              showsVerticalScrollIndicator
+              keyboardShouldPersistTaps="handled">
+              <Text style={styles.menuTitle}>설정</Text>
+              <View style={styles.analysisWindowPanel}>
+                <Text style={styles.settingLabel}>분석 범위 설정</Text>
                 <Text style={styles.settingDescription}>
-                  실험용 로그 기능입니다. Moonshine tiny-ko가 트리거 이후 오디오를 받아쓰지만 Gemma 판단에는 사용되지 않습니다.
+                  트리거 기준으로 Gemma가 확인할 이전/이후 오디오 길이를 조정합니다.
+                </Text>
+                <SecondsSlider
+                  label="이전 분석 범위"
+                  value={preTriggerSeconds}
+                  onChange={value => updateAnalysisWindowSeconds('pre', value)}
+                />
+                <SecondsSlider
+                  label="이후 분석 범위"
+                  value={postTriggerSeconds}
+                  onChange={value => updateAnalysisWindowSeconds('post', value)}
+                />
+                <Text style={styles.settingHint}>각 값은 1초부터 최대 30초까지 설정할 수 있습니다.</Text>
+              </View>
+              <View style={styles.analysisWindowPanel}>
+                <Text style={styles.settingLabel}>모션 센서 설정</Text>
+                <Text style={styles.settingDescription}>
+                  센서 값이 기준값보다 커지면 움직임 트리거가 발생합니다. 값이 낮을수록 더 민감하게 반응합니다.
+                </Text>
+                <View style={styles.motionSensorFieldRow}>
+                  <Text style={styles.motionSensorFieldLabel}>가속도</Text>
+                  <TextInput
+                    style={styles.motionSensorInput}
+                    value={sensorThresholdInput}
+                    onChangeText={updateSensorThresholdInput}
+                    onBlur={() => {
+                      if (!parsePositiveInteger(sensorThresholdInput)) {
+                        setSensorThresholdInput(String(sensorThreshold));
+                      }
+                    }}
+                    keyboardType="number-pad"
+                    placeholder={String(DEFAULT_SENSOR_THRESHOLD)}
+                  />
+                </View>
+                <View style={styles.motionSensorFieldRow}>
+                  <Text style={styles.motionSensorFieldLabel}>자이로스코프</Text>
+                  <TextInput
+                    style={styles.motionSensorInput}
+                    value={gyroThresholdInput}
+                    onChangeText={updateGyroThresholdInput}
+                    onBlur={() => {
+                      if (!parsePositiveInteger(gyroThresholdInput)) {
+                        setGyroThresholdInput(String(gyroThreshold));
+                      }
+                    }}
+                    keyboardType="number-pad"
+                    placeholder={String(DEFAULT_GYRO_THRESHOLD)}
+                  />
+                </View>
+                <View style={styles.motionSensorResetRow}>
+                  <Pressable
+                    style={[styles.secondaryButton, styles.motionSensorResetButton]}
+                    onPress={resetMotionSensorThresholds}>
+                    <Text style={styles.secondaryButtonText}>기본값으로 리셋</Text>
+                  </Pressable>
+                </View>
+                <Text style={styles.settingHint}>
+                  기본값은 가속도계 {DEFAULT_SENSOR_THRESHOLD}, 자이로스코프 {DEFAULT_GYRO_THRESHOLD}입니다.
                 </Text>
               </View>
-              <Switch
-                value={sttEngine === STT_ENGINE_ON}
-                onValueChange={enabled => updateSttEngine(enabled ? STT_ENGINE_ON : STT_ENGINE_OFF)}
+              <View style={styles.analysisWindowPanel}>
+                <Text style={styles.settingLabel}>경로 이탈 감지</Text>
+                <Text style={styles.settingDescription}>
+                  활성 경로에서 지정 거리 이상 벗어난 상태가 설정 시간 이상 지속되면 경로 이탈로 표시합니다.
+                </Text>
+                <View style={styles.motionSensorFieldRow}>
+                  <Text style={styles.motionSensorFieldLabel}>거리(m)</Text>
+                  <TextInput
+                    style={styles.motionSensorInput}
+                    value={routeDeviationDistanceInput}
+                    onChangeText={updateRouteDeviationDistanceInput}
+                    onBlur={() => {
+                      if (!parsePositiveInteger(routeDeviationDistanceInput)) {
+                        setRouteDeviationDistanceInput(String(routeDeviationDistanceMeters));
+                      }
+                    }}
+                    keyboardType="number-pad"
+                    placeholder={String(DEFAULT_ROUTE_DEVIATION_DISTANCE_METERS)}
+                  />
+                </View>
+                <View style={styles.motionSensorFieldRow}>
+                  <Text style={styles.motionSensorFieldLabel}>시간(초)</Text>
+                  <TextInput
+                    style={styles.motionSensorInput}
+                    value={routeDeviationDurationInput}
+                    onChangeText={updateRouteDeviationDurationInput}
+                    onBlur={() => {
+                      if (!parsePositiveInteger(routeDeviationDurationInput)) {
+                        setRouteDeviationDurationInput(String(routeDeviationDurationSeconds));
+                      }
+                    }}
+                    keyboardType="number-pad"
+                    placeholder={String(DEFAULT_ROUTE_DEVIATION_DURATION_SECONDS)}
+                  />
+                </View>
+                <Text style={styles.settingHint}>
+                  기본값은 {DEFAULT_ROUTE_DEVIATION_DISTANCE_METERS}m, {DEFAULT_ROUTE_DEVIATION_DURATION_SECONDS}초입니다.
+                </Text>
+              </View>
+              <View style={styles.settingRow}>
+                <View style={styles.settingTextGroup}>
+                  <Text style={styles.settingLabel}>STT 기능</Text>
+                  <Text style={styles.settingDescription}>
+                    실험용 로그 기능입니다. Moonshine tiny-ko가 트리거 이후 오디오를 받아쓰지만 Gemma 판단에는 사용되지 않습니다.
+                  </Text>
+                </View>
+                <Switch
+                  value={sttEngine === STT_ENGINE_ON}
+                  onValueChange={enabled => updateSttEngine(enabled ? STT_ENGINE_ON : STT_ENGINE_OFF)}
+                />
+              </View>
+              <Text style={styles.settingHint}>
+                기본값은 OFF입니다. 켜도 신고 판단에는 영향을 주지 않고 로그에만 남습니다.
+              </Text>
+              <View style={styles.settingRow}>
+                <View style={styles.settingTextGroup}>
+                  <Text style={styles.settingLabel}>위급 시 사이렌 기능(소리)</Text>
+                  <Text style={styles.settingDescription}>
+                    자동 신고 전 카운트다운 팝업이 뜰 때 진동과 함께 사이렌 소리를 재생합니다.
+                  </Text>
+                </View>
+                <Switch
+                  value={sirenEnabled}
+                  onValueChange={updateSirenEnabled}
+                />
+              </View>
+              <Text style={styles.settingHint}>
+                끄면 위급 상황 팝업에서는 진동만 동작합니다.
+              </Text>
+              <SavedRouteSelector
+                routes={safetyProfile.savedRoutes}
+                activeRouteId={safetyProfile.activeRouteId}
+                onSelect={activateSavedRoute}
               />
-            </View>
-            <Text style={styles.settingHint}>
-              기본값은 OFF입니다. 켜도 신고 판단에는 영향을 주지 않고 로그에만 남습니다.
-            </Text>
-            <Pressable
-              style={styles.menuOption}
-              onPress={() => {
-                setSettingsVisible(false);
-                setProfileDraft(safetyProfile);
-                setProfileEditorVisible(true);
-              }}>
-              <Text style={styles.menuOptionText}>민감 정보 수정</Text>
-            </Pressable>
-            <Pressable
-              style={styles.menuCloseButton}
-              onPress={() => setSettingsVisible(false)}>
-              <Text style={styles.menuCloseButtonText}>닫기</Text>
-            </Pressable>
+              <Pressable
+                style={styles.menuCloseButton}
+                onPress={() => setSettingsVisible(false)}>
+                <Text style={styles.menuCloseButtonText}>닫기</Text>
+              </Pressable>
+            </ScrollView>
           </View>
         </View>
       </Modal>
@@ -1030,14 +2158,14 @@ function App() {
             />
             <PromptEditorField
               label="1차 추론 프롬프트"
-              description="트리거 직전 최대 10초 오디오 분석 지침입니다. {{sampleRate}}, {{triggerSource}}, {{locationText}} 토큰을 사용할 수 있습니다."
+              description="트리거 직전 오디오 분석 지침입니다. {{preTriggerSeconds}}, {{sampleRate}}, {{triggerSource}}, {{locationText}} 토큰을 사용할 수 있습니다."
               value={gemmaPromptDraft.primary}
               onChangeText={value => updateGemmaPromptDraft('primary', value)}
               minHeight={360}
             />
             <PromptEditorField
               label="2차 추론 프롬프트"
-              description="트리거 이후 7초 오디오 분석 지침입니다. 1차 토큰에 더해 {{previousContext}} 토큰을 사용할 수 있습니다."
+              description="트리거 이후 오디오 분석 지침입니다. {{postTriggerSeconds}}와 1차 토큰에 더해 {{previousContext}} 토큰을 사용할 수 있습니다."
               value={gemmaPromptDraft.secondary}
               onChangeText={value => updateGemmaPromptDraft('secondary', value)}
               minHeight={360}
@@ -1060,13 +2188,22 @@ function App() {
               subtitle={'\uC800\uC7A5\uB41C \uC815\uBCF4\uB294 \uC774 \uAE30\uAE30 \uC571 \uB0B4\uBD80 \uC124\uC815\uC5D0 \uBCF4\uAD00\uB429\uB2C8\uB2E4.'}
               profile={profileDraft}
               onChange={updateProfileDraft}
-              onPickLocation={openLocationPicker}
-              onOpenRoutePicker={openRoutePicker}
+              kakaoKey={KAKAO_MAP_JAVASCRIPT_KEY}
+              onOpenRouteAutoCapture={openRouteAutoCapture}
+              onOpenManualRouteFlow={openManualRouteFlow}
+              onUpdateRoute={updateProfileDraftRoute}
+              onActivateRoute={activateProfileDraftRoute}
+              onEditRouteWaypoints={openSavedRouteWaypointEditor}
+              onDeleteRoute={deleteProfileDraftRoute}
               onSave={saveSafetyProfile}
-              onClose={closeProfileEditor}
               saveLabel={'\uC800\uC7A5'}
+              reserveHeaderActionSpace
+              showFooterActions={false}
             />
           </ScrollView>
+          <Pressable style={styles.profileFloatingSaveButton} onPress={saveSafetyProfile}>
+            <Text style={styles.buttonText}>{'\uC800\uC7A5'}</Text>
+          </Pressable>
         </SafeAreaView>
       </Modal>
 
@@ -1074,19 +2211,59 @@ function App() {
         visible={locationPickerTarget !== null}
         kakaoKey={KAKAO_MAP_JAVASCRIPT_KEY}
         webViewRef={locationPickerWebViewRef}
-        onClose={() => setLocationPickerTarget(null)}
+        onClose={closeLocationPicker}
         onMessage={handleLocationPickerMessage}
       />
       <RoutePickerModal
         visible={routePickerVisible}
         kakaoKey={KAKAO_MAP_JAVASCRIPT_KEY}
-        startLocation={profileDraft.startLocation}
-        destinationLocation={profileDraft.destinationLocation}
-        routePath={profileDraft.childRoutePath}
+        routeKey={routePickerKey}
+        startLocation={routePickerStartLocation}
+        destinationLocation={routePickerDestinationLocation}
+        routePath={routePickerPath}
         mode={routePickerMode}
-        onClose={closeRoutePicker}
         onBack={handleRouteBack}
         onMessage={handleRoutePickerMessage}
+      />
+      <ManualRouteInfoModal
+        visible={manualRouteInfoVisible}
+        draft={manualRouteInfoDraft}
+        onChange={(key, value) =>
+          setManualRouteInfoDraft(current => ({...current, [key]: value}))
+        }
+        onCancel={cancelManualRouteInfo}
+        onSave={saveManualRouteInfo}
+      />
+      <RouteAutoCaptureModal
+        visible={routeCaptureVisible}
+        kakaoKey={KAKAO_MAP_JAVASCRIPT_KEY}
+        phase={routeCapturePhase}
+        startLocation={routeCaptureStart}
+        endLocation={routeCaptureEnd}
+        waypoints={routeCaptureWaypoints}
+        routeInfoDraft={routeCaptureInfoDraft}
+        onRouteInfoChange={(key, value) =>
+          setRouteCaptureInfoDraft(current => ({...current, [key]: value}))
+        }
+        onStartCapture={startRouteAutoCapture}
+        onStopCapture={stopRouteAutoCapture}
+        onSaveRoute={saveAutoCapturedRoute}
+        onClose={closeRouteAutoCapture}
+        onMessage={handleRouteAutoCaptureMessage}
+      />
+      <RouteStatusModal
+        visible={routeStatusVisible}
+        kakaoKey={KAKAO_MAP_JAVASCRIPT_KEY}
+        webViewRef={routeStatusWebViewRef}
+        startLocation={safetyProfile.startLocation}
+        destinationLocation={safetyProfile.destinationLocation}
+        routePath={safetyProfile.childRoutePath}
+        currentLocation={routeStatusLocation}
+        mapVersion={routeStatusMapVersion}
+        mapStatusText={routeStatusMapStatusText}
+        routeDeviationDistanceMeters={routeDeviationDistanceMeters}
+        routeDeviationStatus={routeDeviationStatus}
+        onClose={() => setRouteStatusVisible(false)}
       />
       <Modal visible={audioLogsVisible} animationType="slide" onRequestClose={closeAudioLogs}>
         <SafeAreaView style={styles.logsScreen}>
@@ -1185,6 +2362,7 @@ function App() {
                   <LogRow label="monitoring_mode" value={log.monitoring_mode} />
                   <LogRow label="crime_type" value={log.crime_type} />
                   <LogRow label="is_emergency" value={String(log.is_emergency)} />
+                  <LogRow label="route_deviation" value={String(log.route_deviation ?? false)} />
                   <LogRow label="final_decision" value={String(log.final_decision ?? false)} />
                   <LogRow label="model_id" value={log.model_id} />
                   <LogRow label="trigger_source" value={log.trigger_source} />
@@ -1204,10 +2382,6 @@ function App() {
                     value={log.audio_summary}
                   />
                   <LogRow
-                    label="stt_context_used"
-                    value={String(log.stt_context_used ?? false)}
-                  />
-                  <LogRow
                     label="decision_reason"
                     value={log.decision_reason}
                   />
@@ -1221,10 +2395,6 @@ function App() {
                   />
                   <LogRow label="stt_engine" value={log.stt_engine} />
                   <LogRow label="stt_error" value={log.stt_error} />
-                  <LogRow
-                    label="situation_summary"
-                    value={log.situation_summary}
-                  />
                   <LogRow
                     label="raw_model_response"
                     value={log.raw_model_response}
@@ -1241,33 +2411,151 @@ function App() {
   );
 }
 
+function SecondsSlider({
+  label,
+  value,
+  onChange,
+}: {
+  label: string;
+  value: number;
+  onChange: (value: number) => void;
+}) {
+  const sliderTrackRef = useRef<React.ElementRef<typeof View>>(null);
+  const trackLeftRef = useRef(0);
+  const trackWidthRef = useRef(1);
+  const lastSentValueRef = useRef(value);
+  const normalizedValue = normalizeAnalysisWindowSeconds(value, DEFAULT_PRE_TRIGGER_SECONDS);
+  const percentage =
+    ((normalizedValue - MIN_ANALYSIS_WINDOW_SECONDS) /
+      (MAX_ANALYSIS_WINDOW_SECONDS - MIN_ANALYSIS_WINDOW_SECONDS)) *
+    100;
+
+  useEffect(() => {
+    lastSentValueRef.current = normalizedValue;
+  }, [normalizedValue]);
+
+  const updateFromPageX = useCallback(
+    (pageX: number) => {
+      const ratio = Math.max(
+        0,
+        Math.min(1, (pageX - trackLeftRef.current) / trackWidthRef.current),
+      );
+      const nextValue =
+        MIN_ANALYSIS_WINDOW_SECONDS +
+        ratio * (MAX_ANALYSIS_WINDOW_SECONDS - MIN_ANALYSIS_WINDOW_SECONDS);
+      const normalizedNextValue = normalizeAnalysisWindowSeconds(nextValue, normalizedValue);
+      if (normalizedNextValue === lastSentValueRef.current) {
+        return;
+      }
+      lastSentValueRef.current = normalizedNextValue;
+      onChange(normalizedNextValue);
+    },
+    [normalizedValue, onChange],
+  );
+
+  const measureTrackAndUpdate = useCallback(
+    (pageX: number) => {
+      sliderTrackRef.current?.measureInWindow((x, _y, width) => {
+        trackLeftRef.current = x;
+        trackWidthRef.current = Math.max(1, width);
+        updateFromPageX(pageX);
+      });
+    },
+    [updateFromPageX],
+  );
+
+  const updateFromGesture = useCallback(
+    (gestureState: PanResponderGestureState, shouldMeasure: boolean) => {
+      const pageX = gestureState.moveX || gestureState.x0;
+      if (shouldMeasure) {
+        measureTrackAndUpdate(pageX);
+        return;
+      }
+      updateFromPageX(pageX);
+    },
+    [measureTrackAndUpdate, updateFromPageX],
+  );
+
+  const panResponder = useMemo(
+    () =>
+      PanResponder.create({
+        onStartShouldSetPanResponder: () => true,
+        onMoveShouldSetPanResponder: () => true,
+        onPanResponderGrant: (_event, gestureState) => updateFromGesture(gestureState, true),
+        onPanResponderMove: (_event, gestureState) => updateFromGesture(gestureState, false),
+      }),
+    [updateFromGesture],
+  );
+
+  const handleTrackLayout = useCallback((event: LayoutChangeEvent) => {
+    trackWidthRef.current = Math.max(1, event.nativeEvent.layout.width);
+    sliderTrackRef.current?.measureInWindow((x, _y, width) => {
+      trackLeftRef.current = x;
+      trackWidthRef.current = Math.max(1, width);
+    });
+  }, []);
+
+  return (
+    <View style={styles.secondsSlider}>
+      <View style={styles.secondsSliderHeader}>
+        <Text style={styles.secondsSliderLabel}>{label}</Text>
+        <Text style={styles.secondsSliderValue}>{normalizedValue}초</Text>
+      </View>
+      <View
+        ref={sliderTrackRef}
+        style={styles.sliderTrack}
+        onLayout={handleTrackLayout}
+        {...panResponder.panHandlers}>
+        <View pointerEvents="none" style={[styles.sliderFill, {width: `${percentage}%`}]} />
+        <View pointerEvents="none" style={[styles.sliderThumb, {left: `${percentage}%`}]} />
+      </View>
+      <View style={styles.sliderRangeLabels}>
+        <Text style={styles.sliderRangeLabel}>{MIN_ANALYSIS_WINDOW_SECONDS}초</Text>
+        <Text style={styles.sliderRangeLabel}>{MAX_ANALYSIS_WINDOW_SECONDS}초</Text>
+      </View>
+    </View>
+  );
+}
+
 function SafetyProfileForm({
   title,
   subtitle,
   profile,
   onChange,
-  onPickLocation,
-  onOpenRoutePicker,
+  kakaoKey,
+  onOpenRouteAutoCapture,
+  onOpenManualRouteFlow,
+  onUpdateRoute,
+  onActivateRoute,
+  onEditRouteWaypoints,
+  onDeleteRoute,
   onSave,
   saveLabel,
   onClose,
+  reserveHeaderActionSpace = false,
+  showFooterActions = true,
 }: {
   title: string;
   subtitle: string;
   profile: SafetyProfile;
   onChange: <K extends keyof SafetyProfile>(key: K, value: SafetyProfile[K]) => void;
-  onPickLocation: (target: LocationPickerTarget) => void;
-  onOpenRoutePicker: () => void;
+  kakaoKey: string;
+  onOpenRouteAutoCapture: () => void;
+  onOpenManualRouteFlow: () => void;
+  onUpdateRoute: (routeId: string, updates: Partial<SavedRoute>) => void;
+  onActivateRoute: (routeId: string) => void;
+  onEditRouteWaypoints: (routeId: string) => void;
+  onDeleteRoute: (routeId: string) => void;
   onSave: () => void;
   saveLabel: string;
   onClose?: () => void;
+  reserveHeaderActionSpace?: boolean;
+  showFooterActions?: boolean;
 }) {
-  const routeReady = Boolean(profile.startLocation && profile.destinationLocation);
-
   return (
     <View style={styles.profilePanel}>
       <View style={styles.profileHeaderRow}>
-        <View style={styles.profileHeaderText}>
+        <View style={[styles.profileHeaderText, reserveHeaderActionSpace && styles.profileHeaderTextWithAction]}>
           <Text style={styles.eyebrow}>Sensitive profile</Text>
           <Text style={styles.title}>{title}</Text>
           <Text style={styles.subtitle}>{subtitle}</Text>
@@ -1328,51 +2616,45 @@ function SafetyProfileForm({
       </View>
 
       <View style={styles.formSection}>
-        <LocationSelectButton
-          label={'\uCD9C\uBC1C\uC9C0 \uC120\uD0DD'}
-          location={profile.startLocation}
-          onPress={() => onPickLocation('startLocation')}
-        />
-        <LocationSelectButton
-          label={'\uB3C4\uCC29\uC9C0 \uC120\uD0DD'}
-          location={profile.destinationLocation}
-          onPress={() => onPickLocation('destinationLocation')}
-        />
-        {routeReady ? (
-          <View style={styles.inputGroup}>
-            <Text style={styles.fieldLabel}>{'\uB4F1\uD558\uAD50 \uCEE4\uC2A4\uD140 \uACBD\uB85C'}</Text>
-            <Pressable style={styles.locationButton} onPress={onOpenRoutePicker}>
-              <Text style={styles.locationButtonText}>
-                {profile.childRoutePath.length > 0 ? '\uACBD\uB85C \uBCF4\uAE30' : '\uACBD\uB85C \uC785\uB825'}
-              </Text>
-            </Pressable>
-            <Text style={styles.locationSummary}>
-              {formatRoutePathSummary(profile.childRoutePath)}
-            </Text>
-          </View>
-        ) : null}
-        <TimeRangeGroup
-          startHour={profile.startHour}
-          startMinute={profile.startMinute}
-          endHour={profile.destinationHour}
-          endMinute={profile.destinationMinute}
-          onStartHourChange={value => onChange('startHour', value)}
-          onStartMinuteChange={value => onChange('startMinute', value)}
-          onEndHourChange={value => onChange('destinationHour', value)}
-          onEndMinuteChange={value => onChange('destinationMinute', value)}
-        />
+        <View style={styles.inputGroup}>
+          <Text style={styles.fieldLabel}>{'\uACBD\uB85C \uC790\uB3D9 \uC778\uC2DD'}</Text>
+          <Pressable style={styles.locationButton} onPress={onOpenRouteAutoCapture}>
+            <Text style={styles.locationButtonText}>{'\uC2E4\uC2DC\uAC04 GPS\uB85C \uACBD\uB85C \uC218\uC9D1'}</Text>
+          </Pressable>
+        </View>
+        <View style={styles.inputGroup}>
+          <Text style={styles.fieldLabel}>{'\uACBD\uB85C \uC218\uB3D9 \uC778\uC2DD'}</Text>
+          <Pressable style={styles.locationButton} onPress={onOpenManualRouteFlow}>
+            <Text style={styles.locationButtonText}>{'\uCD9C\uBC1C\uC9C0-\uB3C4\uCC29\uC9C0-\uACBD\uB85C \uC21C\uC11C\uB85C \uC785\uB825'}</Text>
+          </Pressable>
+          <Text style={styles.locationSummary}>
+            {formatSavedRouteSummary(profile.savedRoutes, profile.activeRouteId)}
+          </Text>
+        </View>
       </View>
 
-      <View style={styles.profileActionRow}>
-        <Pressable style={[styles.button, styles.profileSaveButton]} onPress={onSave}>
-          <Text style={styles.buttonText}>{saveLabel}</Text>
-        </Pressable>
-        {onClose ? (
-          <Pressable style={styles.profileCloseButton} onPress={onClose}>
-            <Text style={styles.secondaryButtonText}>{'\uB2EB\uAE30'}</Text>
+      <SavedRouteManager
+        routes={profile.savedRoutes}
+        activeRouteId={profile.activeRouteId}
+        kakaoKey={kakaoKey}
+        onUpdateRoute={onUpdateRoute}
+        onActivateRoute={onActivateRoute}
+        onEditRouteWaypoints={onEditRouteWaypoints}
+        onDeleteRoute={onDeleteRoute}
+      />
+
+      {showFooterActions ? (
+        <View style={styles.profileActionRow}>
+          <Pressable style={[styles.button, styles.profileSaveButton]} onPress={onSave}>
+            <Text style={styles.buttonText}>{saveLabel}</Text>
           </Pressable>
-        ) : null}
-      </View>
+          {onClose ? (
+            <Pressable style={styles.profileCloseButton} onPress={onClose}>
+              <Text style={styles.secondaryButtonText}>{'\uB2EB\uAE30'}</Text>
+            </Pressable>
+          ) : null}
+        </View>
+      ) : null}
 
     </View>
   );
@@ -1559,6 +2841,68 @@ function TimePartInput({
   );
 }
 
+function RouteInfoEditor({
+  draft,
+  onChange,
+}: {
+  draft: RouteInfoDraft;
+  onChange: <K extends keyof RouteInfoDraft>(key: K, value: RouteInfoDraft[K]) => void;
+}) {
+  return (
+    <View style={styles.routeInfoEditor}>
+      <ProfileInput
+        label={'\uACBD\uB85C \uC774\uB984'}
+        value={draft.name}
+        placeholder={'\uC608: \uD559\uAD50 \uAC00\uB294 \uAE38'}
+        onChangeText={value => onChange('name', value)}
+      />
+      <TimeRangeGroup
+        startHour={draft.startHour}
+        startMinute={draft.startMinute}
+        endHour={draft.destinationHour}
+        endMinute={draft.destinationMinute}
+        onStartHourChange={value => onChange('startHour', value)}
+        onStartMinuteChange={value => onChange('startMinute', value)}
+        onEndHourChange={value => onChange('destinationHour', value)}
+        onEndMinuteChange={value => onChange('destinationMinute', value)}
+      />
+    </View>
+  );
+}
+
+function ManualRouteInfoModal({
+  visible,
+  draft,
+  onChange,
+  onCancel,
+  onSave,
+}: {
+  visible: boolean;
+  draft: RouteInfoDraft;
+  onChange: <K extends keyof RouteInfoDraft>(key: K, value: RouteInfoDraft[K]) => void;
+  onCancel: () => void;
+  onSave: () => void;
+}) {
+  return (
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={onCancel}>
+      <View style={styles.modalBackdrop}>
+        <View style={styles.manualRouteInfoCard}>
+          <Text style={styles.menuTitle}>경로 정보 입력</Text>
+          <RouteInfoEditor draft={draft} onChange={onChange} />
+          <View style={styles.routeCaptureActionRow}>
+            <Pressable style={[styles.secondaryButton, styles.routeCaptureActionButton]} onPress={onCancel}>
+              <Text style={styles.secondaryButtonText}>경로 다시 수정</Text>
+            </Pressable>
+            <Pressable style={[styles.button, styles.routeCaptureActionButton]} onPress={onSave}>
+              <Text style={styles.buttonText}>최종 저장</Text>
+            </Pressable>
+          </View>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
 function ModeButton({
   label,
   selected,
@@ -1576,6 +2920,162 @@ function ModeButton({
         {label}
       </Text>
     </Pressable>
+  );
+}
+
+function SavedRouteSelector({
+  routes,
+  activeRouteId,
+  onSelect,
+}: {
+  routes: SavedRoute[];
+  activeRouteId: string;
+  onSelect: (routeId: string) => void;
+}) {
+  return (
+    <View style={styles.savedRoutePanel}>
+      <Text style={styles.settingLabel}>{'\uD65C\uC131 \uB4F1\uD558\uAD50 \uACBD\uB85C'}</Text>
+      {routes.length === 0 ? (
+        <Text style={styles.settingDescription}>
+          {'\uC800\uC7A5\uB41C \uACBD\uB85C\uAC00 \uC5C6\uC2B5\uB2C8\uB2E4. \uAC1C\uC778 \uC815\uBCF4 \uC218\uC815\uC5D0\uC11C \uACBD\uB85C\uB97C \uC790\uB3D9 \uC778\uC2DD\uD558\uAC70\uB098 \uC785\uB825\uD574 \uC8FC\uC138\uC694.'}
+        </Text>
+      ) : (
+        routes.map(route => (
+          <Pressable
+            key={route.id}
+            style={[
+              styles.savedRouteOption,
+              route.id === activeRouteId && styles.savedRouteOptionActive,
+            ]}
+            onPress={() => onSelect(route.id)}>
+            <View style={styles.savedRouteOptionText}>
+              <Text
+                style={[
+                  styles.savedRouteName,
+                  route.id === activeRouteId && styles.savedRouteNameActive,
+                ]}>
+                {route.name}
+              </Text>
+              <Text
+                style={[
+                  styles.savedRouteMeta,
+                  route.id === activeRouteId && styles.savedRouteMetaActive,
+                ]}>
+                {`${route.waypoints.length}\uAC1C \uC9C0\uC810 · ${formatRouteTimeRange(route)}`}
+              </Text>
+            </View>
+            <Text
+              style={[
+                styles.savedRouteBadge,
+                route.id === activeRouteId && styles.savedRouteBadgeActive,
+              ]}>
+              {route.id === activeRouteId ? '\uC0AC\uC6A9 \uC911' : '\uC120\uD0DD'}
+            </Text>
+          </Pressable>
+        ))
+      )}
+    </View>
+  );
+}
+
+function SavedRouteManager({
+  routes,
+  activeRouteId,
+  kakaoKey,
+  onUpdateRoute,
+  onActivateRoute,
+  onEditRouteWaypoints,
+  onDeleteRoute,
+}: {
+  routes: SavedRoute[];
+  activeRouteId: string;
+  kakaoKey: string;
+  onUpdateRoute: (routeId: string, updates: Partial<SavedRoute>) => void;
+  onActivateRoute: (routeId: string) => void;
+  onEditRouteWaypoints: (routeId: string) => void;
+  onDeleteRoute: (routeId: string) => void;
+}) {
+  const [expandedRouteId, setExpandedRouteId] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (expandedRouteId && !routes.some(route => route.id === expandedRouteId)) {
+      setExpandedRouteId(null);
+    }
+  }, [expandedRouteId, routes]);
+
+  return (
+    <View style={styles.formSection}>
+      <View style={styles.routeManagerHeader}>
+        <Text style={styles.settingLabel}>{'\uC800\uC7A5\uB41C \uACBD\uB85C \uAD00\uB9AC'}</Text>
+        <Text style={styles.settingHint}>{`${routes.length}/${MAX_SAVED_ROUTES}`}</Text>
+      </View>
+      {routes.length === 0 ? (
+        <Text style={styles.settingDescription}>
+          {'\uC544\uC9C1 \uC800\uC7A5\uB41C \uACBD\uB85C\uAC00 \uC5C6\uC2B5\uB2C8\uB2E4. \uC704\uC758 \uC790\uB3D9/\uC218\uB3D9 \uC778\uC2DD\uC73C\uB85C \uACBD\uB85C\uB97C \uBA3C\uC800 \uB9CC\uB4E4\uC5B4 \uC8FC\uC138\uC694.'}
+        </Text>
+      ) : (
+        routes.map(route => {
+          const isExpanded = expandedRouteId === route.id;
+          const isActive = route.id === activeRouteId;
+          return (
+            <View key={route.id} style={styles.routeManagerItem}>
+              <Pressable
+                style={styles.routeManagerSummary}
+                onPress={() => setExpandedRouteId(isExpanded ? null : route.id)}
+                onLongPress={() => onDeleteRoute(route.id)}>
+                <View style={styles.savedRouteOptionText}>
+                  <Text style={styles.savedRouteName}>{route.name}</Text>
+                  <Text style={styles.savedRouteMeta}>
+                    {`${route.waypoints.length}\uAC1C \uC9C0\uC810 · ${formatRouteTimeRange(route)}`}
+                  </Text>
+                  <Text style={styles.savedRouteMeta} numberOfLines={2}>
+                    {`${route.start.address} → ${route.end.address}`}
+                  </Text>
+                </View>
+                <Text style={[styles.savedRouteBadge, isActive && styles.routeManagerActiveBadge]}>
+                  {isActive ? '\uC0AC\uC6A9 \uC911' : '\uBCF4\uAE30'}
+                </Text>
+              </Pressable>
+              {isExpanded ? (
+                <View style={styles.routeManagerEditor}>
+                  <WebView
+                    key={`route-preview-${route.id}-${route.waypoints.length}`}
+                    source={{
+                      html: buildKakaoRoutePreviewHtml(kakaoKey, route),
+                      baseUrl: 'http://localhost',
+                    }}
+                    originWhitelist={['*']}
+                    javaScriptEnabled
+                    domStorageEnabled
+                    mixedContentMode="always"
+                    scrollEnabled={false}
+                    style={styles.routePreviewWebView}
+                  />
+                  <RouteInfoEditor
+                    draft={route}
+                    onChange={(key, value) => onUpdateRoute(route.id, {[key]: value})}
+                  />
+                  <View style={styles.routeManagerActionRow}>
+                    <Pressable
+                      style={[styles.secondaryButton, styles.routeManagerActionButton]}
+                      onPress={() => onActivateRoute(route.id)}>
+                      <Text style={styles.secondaryButtonText}>
+                        {isActive ? '\uD604\uC7AC \uC0AC\uC6A9 \uC911' : '\uC774 \uACBD\uB85C \uC0AC\uC6A9'}
+                      </Text>
+                    </Pressable>
+                    <Pressable
+                      style={[styles.button, styles.routeManagerActionButton]}
+                      onPress={() => onEditRouteWaypoints(route.id)}>
+                      <Text style={styles.buttonText}>{'\uC6E8\uC774\uD3EC\uC778\uD2B8 \uC218\uC815'}</Text>
+                    </Pressable>
+                  </View>
+                </View>
+              ) : null}
+            </View>
+          );
+        })
+      )}
+    </View>
   );
 }
 
@@ -1606,30 +3106,6 @@ function ProfileInput({
     </View>
   );
 }
-function LocationSelectButton({
-  label,
-  location,
-  onPress,
-}: {
-  label: string;
-  location: RoutineLocation | null;
-  onPress: () => void;
-}) {
-  return (
-    <View style={styles.inputGroup}>
-      <Text style={styles.fieldLabel}>{label}</Text>
-      <Pressable style={styles.locationButton} onPress={onPress}>
-        <Text style={styles.locationButtonText}>
-          {location ? '다시 선택' : label}
-        </Text>
-      </Pressable>
-      {location ? (
-        <Text style={styles.locationSummary}>{formatRoutineLocation(location)}</Text>
-      ) : null}
-    </View>
-  );
-}
-
 function LocationPickerModal({
   visible,
   kakaoKey,
@@ -1664,21 +3140,21 @@ function LocationPickerModal({
 function RoutePickerModal({
   visible,
   kakaoKey,
+  routeKey,
   startLocation,
   destinationLocation,
   routePath,
   mode,
-  onClose,
   onBack,
   onMessage,
 }: {
   visible: boolean;
   kakaoKey: string;
+  routeKey: string;
   startLocation: RoutineLocation | null;
   destinationLocation: RoutineLocation | null;
   routePath: RoutePathPoint[];
   mode: RoutePickerMode;
-  onClose: () => void;
   onBack: () => void;
   onMessage: (event: WebViewMessageEvent) => void;
 }) {
@@ -1689,21 +3165,8 @@ function RoutePickerModal({
   return (
     <Modal visible={visible} animationType="slide" onRequestClose={onBack}>
       <SafeAreaView style={styles.locationPickerScreen}>
-        <View style={styles.logsHeader}>
-          <Pressable style={styles.backButton} onPress={onBack}>
-            <Text style={styles.backButtonText}>{'\uB4A4\uB85C'}</Text>
-          </Pressable>
-          <View style={styles.routeHeaderText}>
-            <Text style={styles.logsTitle}>
-              {mode === 'view' ? '\uACBD\uB85C \uBCF4\uAE30' : '\uACBD\uB85C \uC785\uB825'}
-            </Text>
-          </View>
-          <Pressable style={styles.closeButton} onPress={onClose}>
-            <Text style={styles.closeButtonText}>{'\uB2EB\uAE30'}</Text>
-          </Pressable>
-        </View>
         <WebView
-          key={`route-${mode}-${routePath.length}`}
+          key={`route-${routeKey}-${mode}-${routePath.length}`}
           source={{
             html: buildKakaoRoutePickerHtml(kakaoKey, startLocation, destinationLocation, routePath, mode),
             baseUrl: 'http://localhost',
@@ -1719,6 +3182,221 @@ function RoutePickerModal({
     </Modal>
   );
 }
+
+function RouteAutoCaptureModal({
+  visible,
+  kakaoKey,
+  phase,
+  startLocation,
+  endLocation,
+  waypoints,
+  routeInfoDraft,
+  onRouteInfoChange,
+  onStartCapture,
+  onStopCapture,
+  onSaveRoute,
+  onClose,
+  onMessage,
+}: {
+  visible: boolean;
+  kakaoKey: string;
+  phase: RouteCapturePhase;
+  startLocation: RoutineLocation | null;
+  endLocation: RoutineLocation | null;
+  waypoints: RoutePathPoint[];
+  routeInfoDraft: RouteInfoDraft;
+  onRouteInfoChange: <K extends keyof RouteInfoDraft>(key: K, value: RouteInfoDraft[K]) => void;
+  onStartCapture: () => void;
+  onStopCapture: () => void;
+  onSaveRoute: () => void;
+  onClose: () => void | Promise<void>;
+  onMessage: (event: WebViewMessageEvent) => void;
+}) {
+  if (!startLocation) {
+    return null;
+  }
+
+  const mapEndLocation =
+    endLocation ??
+    routePointToRoutineLocation(
+      waypoints[waypoints.length - 1] ?? startLocation,
+      '자동 수집 목적지',
+    );
+
+  return (
+    <Modal visible={visible} animationType="slide" onRequestClose={onClose}>
+      <SafeAreaView style={styles.locationPickerScreen}>
+        <View style={styles.logsHeader}>
+          <View style={styles.routeHeaderText}>
+            <Text style={styles.logsTitle}>{'\uACBD\uB85C \uC790\uB3D9 \uC778\uC2DD'}</Text>
+            <Text style={styles.logsSubtitle}>
+              {phase === 'collecting'
+                ? `${waypoints.length}\uAC1C \uC9C0\uC810 \uC218\uC9D1 \uC911`
+                : phase === 'review'
+                  ? '\uC218\uC9D1\uB41C \uACBD\uB85C \uAC80\uC218'
+                  : '\uC2DC\uC791 \uC9C0\uC810 \uD655\uC778'}
+            </Text>
+          </View>
+          <Pressable style={styles.closeButton} onPress={onClose}>
+            <Text style={styles.closeButtonText}>{'\uB2EB\uAE30'}</Text>
+          </Pressable>
+        </View>
+        <WebView
+          key={`auto-route-${phase}-${waypoints.length}-${mapEndLocation.latitude}-${mapEndLocation.longitude}`}
+          source={{
+            html: buildKakaoAutoRouteCaptureHtml(
+              kakaoKey,
+              phase,
+              startLocation,
+              mapEndLocation,
+              waypoints,
+            ),
+            baseUrl: 'http://localhost',
+          }}
+          originWhitelist={['*']}
+          javaScriptEnabled
+          domStorageEnabled
+          mixedContentMode="always"
+          onMessage={onMessage}
+          style={styles.locationWebView}
+        />
+        {phase === 'confirm' ? (
+          <View style={styles.routeCaptureConfirmCard}>
+            <Text style={styles.settingLabel}>
+              {'\uC5EC\uAE30\uB97C \uC0C8\uB85C\uC6B4 \uCD9C\uBC1C\uC9C0\uB85C \uC9C0\uC815\uD558\uACE0 \uC790\uB3D9 \uC218\uC9D1\uC744 \uC2DC\uC791\uD560\uAE4C\uC694?'}
+            </Text>
+            <Text style={styles.settingDescription}>
+              {'GPS \uC624\uCC28\uAC00 \uC788\uC744 \uC218 \uC788\uC73C\uBBC0\uB85C, \uC9C0\uB3C4\uC758 \uCD9C\uBC1C\uC9C0 \uB9C8\uCEE4\uB97C \uB4DC\uB798\uADF8\uD574 \uC704\uCE58\uB97C \uBBF8\uC138 \uC870\uC815\uD55C \uB4A4 \uC2DC\uC791\uD560 \uC218 \uC788\uC2B5\uB2C8\uB2E4.'}
+            </Text>
+            <View style={styles.routeCaptureActionRow}>
+              <Pressable style={[styles.secondaryButton, styles.routeCaptureActionButton]} onPress={onClose}>
+                <Text style={styles.secondaryButtonText}>{'\uCDE8\uC18C'}</Text>
+              </Pressable>
+              <Pressable style={[styles.button, styles.routeCaptureActionButton]} onPress={onStartCapture}>
+                <Text style={styles.buttonText}>{'\uC2DC\uC791'}</Text>
+              </Pressable>
+            </View>
+          </View>
+        ) : null}
+        {phase === 'collecting' ? (
+          <View style={styles.routeCaptureBottomBar}>
+            <Text style={styles.settingDescription}>
+              {'10\uCD08\uB9C8\uB2E4 GPS \uC815\uD655\uB3C4\uC640 4m \uC774\uB3D9 \uC870\uAC74\uC744 \uD655\uC778\uD574 \uC9C0\uC810\uC744 \uC800\uC7A5\uD569\uB2C8\uB2E4.'}
+            </Text>
+            <Pressable style={styles.cancelButton} onPress={onStopCapture}>
+              <Text style={styles.cancelButtonText}>{'\uACBD\uB85C \uC790\uB3D9 \uC218\uC9D1 \uC885\uB8CC'}</Text>
+            </Pressable>
+          </View>
+        ) : null}
+        {phase === 'review' ? (
+          <View style={styles.routeCaptureBottomBar}>
+            <Text style={styles.settingDescription}>
+              {'\uC911\uAC04 \uB9C8\uCEE4\uB97C \uB20C\uB7EC \uC0AD\uC81C\uD558\uACE0, \uB3C4\uCC29\uC9C0 \uB9C8\uCEE4\uB294 \uB4DC\uB798\uADF8\uD574 \uC870\uC815\uD560 \uC218 \uC788\uC2B5\uB2C8\uB2E4.'}
+            </Text>
+            <RouteInfoEditor draft={routeInfoDraft} onChange={onRouteInfoChange} />
+            <Pressable style={styles.button} onPress={onSaveRoute}>
+              <Text style={styles.buttonText}>{'\uCD5C\uC885 \uC800\uC7A5'}</Text>
+            </Pressable>
+          </View>
+        ) : null}
+      </SafeAreaView>
+    </Modal>
+  );
+}
+
+function RouteStatusModal({
+  visible,
+  kakaoKey,
+  webViewRef,
+  startLocation,
+  destinationLocation,
+  routePath,
+  currentLocation,
+  mapVersion,
+  mapStatusText,
+  routeDeviationDistanceMeters,
+  routeDeviationStatus,
+  onClose,
+}: {
+  visible: boolean;
+  kakaoKey: string;
+  webViewRef: React.RefObject<WebView | null>;
+  startLocation: RoutineLocation | null;
+  destinationLocation: RoutineLocation | null;
+  routePath: RoutePathPoint[];
+  currentLocation: EmergencyLocation | null;
+  mapVersion: number;
+  mapStatusText: string;
+  routeDeviationDistanceMeters: number;
+  routeDeviationStatus: RouteDeviationStatus | null;
+  onClose: () => void;
+}) {
+  const statusText = routeDeviationStatus?.route_deviation ? '경로 이탈' : '경로 일치';
+  const distanceText =
+    typeof routeDeviationStatus?.distance_meters === 'number'
+      ? `${Math.round(routeDeviationStatus.distance_meters)}m`
+      : '확인 중';
+  const mapSource = useMemo(
+    () => ({
+      html:
+        startLocation && destinationLocation && currentLocation && routePath.length >= 2
+          ? buildKakaoRouteStatusHtml(
+              kakaoKey,
+              startLocation,
+              destinationLocation,
+              routePath,
+              currentLocation,
+              routeDeviationDistanceMeters,
+              mapStatusText,
+            )
+          : '',
+      baseUrl: 'http://localhost',
+    }),
+    [
+      kakaoKey,
+      startLocation,
+      destinationLocation,
+      routePath,
+      currentLocation,
+      routeDeviationDistanceMeters,
+      mapStatusText,
+      mapVersion,
+    ],
+  );
+
+  if (!startLocation || !destinationLocation || !currentLocation || routePath.length < 2) {
+    return null;
+  }
+
+  return (
+    <Modal visible={visible} animationType="slide" onRequestClose={onClose}>
+      <SafeAreaView style={styles.locationPickerScreen}>
+        <View style={styles.logsHeader}>
+          <View style={styles.routeHeaderText}>
+            <Text style={styles.logsTitle}>현재 경로</Text>
+            <Text style={styles.logsSubtitle}>{`${statusText} · 경로까지 ${distanceText}`}</Text>
+          </View>
+          <View style={styles.routeHeaderActions}>
+            <Pressable style={styles.closeButton} onPress={onClose}>
+              <Text style={styles.closeButtonText}>닫기</Text>
+            </Pressable>
+          </View>
+        </View>
+        <WebView
+          key={`route-status-${mapVersion}`}
+          ref={webViewRef}
+          source={mapSource}
+          originWhitelist={['*']}
+          javaScriptEnabled
+          domStorageEnabled
+          mixedContentMode="always"
+          style={styles.locationWebView}
+        />
+      </SafeAreaView>
+    </Modal>
+  );
+}
+
 function PromptEditorField({
   label,
   description,
@@ -1773,6 +3451,39 @@ function LogRow({
 
 function normalizePhoneNumber(value: string) {
   return value.replace(/\D/g, '').slice(0, 11);
+}
+
+function createRouteInfoDraft(name = ''): RouteInfoDraft {
+  return {
+    name,
+    startHour: '',
+    startMinute: '',
+    destinationHour: '',
+    destinationMinute: '',
+  };
+}
+
+function normalizeTimePart(value: unknown, max: number) {
+  const digits = typeof value === 'string' ? value.replace(/\D/g, '').slice(0, 2) : '';
+  if (!digits) {
+    return '';
+  }
+  const parsed = Number(digits);
+  return Number.isInteger(parsed) && parsed >= 0 && parsed <= max ? digits : '';
+}
+
+function normalizeRouteInfoDraft(
+  draft: Partial<RouteInfoDraft>,
+  fallbackName: string,
+): RouteInfoDraft {
+  const name = typeof draft.name === 'string' ? draft.name.trim() : '';
+  return {
+    name: name || fallbackName.trim() || '\uC800\uC7A5 \uACBD\uB85C',
+    startHour: normalizeTimePart(draft.startHour, 23),
+    startMinute: normalizeTimePart(draft.startMinute, 59),
+    destinationHour: normalizeTimePart(draft.destinationHour, 23),
+    destinationMinute: normalizeTimePart(draft.destinationMinute, 59),
+  };
 }
 
 function parseBirthdayParts(value?: string) {
@@ -1860,16 +3571,77 @@ function normalizeAppSettings(input: Partial<AppSettings> & {sttEnabled?: boolea
     ...defaultAppSettings,
     ...input,
     sttEngine: resolveSttEngine(input),
+    sirenEnabled: input.sirenEnabled ?? defaultAppSettings.sirenEnabled,
     customPrompt: input.customPrompt || defaultAppSettings.customPrompt,
+    sensorThreshold: normalizeMotionSensorThreshold(
+      input.sensorThreshold,
+      defaultAppSettings.sensorThreshold,
+    ),
+    gyroThreshold: normalizeMotionSensorThreshold(
+      input.gyroThreshold,
+      defaultAppSettings.gyroThreshold,
+    ),
     audioRmsThreshold:
       input.audioRmsThreshold ?? defaultAppSettings.audioRmsThreshold,
+    preTriggerSeconds: normalizeAnalysisWindowSeconds(
+      input.preTriggerSeconds,
+      defaultAppSettings.preTriggerSeconds,
+    ),
+    postTriggerSeconds: normalizeAnalysisWindowSeconds(
+      input.postTriggerSeconds,
+      defaultAppSettings.postTriggerSeconds,
+    ),
+    routeDeviationDistanceMeters: normalizePositiveInteger(
+      input.routeDeviationDistanceMeters,
+      defaultAppSettings.routeDeviationDistanceMeters,
+    ),
+    routeDeviationDurationSeconds: normalizePositiveInteger(
+      input.routeDeviationDurationSeconds,
+      defaultAppSettings.routeDeviationDurationSeconds,
+    ),
     safetyProfile: normalizeSafetyProfile(input.safetyProfile),
   };
+}
+
+function normalizeMotionSensorThreshold(value: unknown, fallback: number) {
+  const parsed = parsePositiveInteger(value);
+  return parsed ?? fallback;
+}
+
+function normalizePositiveInteger(value: unknown, fallback: number) {
+  const parsed = parsePositiveInteger(value);
+  return parsed ?? fallback;
+}
+
+function parsePositiveInteger(value: unknown) {
+  const parsed = typeof value === 'number' ? value : Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    return undefined;
+  }
+  return parsed;
+}
+
+function normalizeAnalysisWindowSeconds(value: unknown, fallback: number) {
+  const parsed = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+  return Math.max(
+    MIN_ANALYSIS_WINDOW_SECONDS,
+    Math.min(MAX_ANALYSIS_WINDOW_SECONDS, Math.round(parsed)),
+  );
 }
 
 function normalizeSafetyProfile(input?: Partial<SafetyProfile> & {age?: string; startTime?: string; destinationTime?: string}): SafetyProfile {
   const legacyStart = splitLegacyTime(input?.startTime);
   const legacyDestination = splitLegacyTime(input?.destinationTime);
+  const savedRoutes = normalizeSavedRoutes(input?.savedRoutes);
+  const activeRouteId =
+    typeof input?.activeRouteId === 'string' &&
+    savedRoutes.some(route => route.id === input.activeRouteId)
+      ? input.activeRouteId
+      : savedRoutes.find(route => route.isActive)?.id ?? '';
+  const activeRoute = savedRoutes.find(route => route.id === activeRouteId);
   return {
     ...defaultSafetyProfile,
     ...input,
@@ -1877,13 +3649,18 @@ function normalizeSafetyProfile(input?: Partial<SafetyProfile> & {age?: string; 
     birthday: input?.birthday ?? '',
     gender: normalizeGender(input?.gender),
     emergencyPhone: normalizePhoneNumber(input?.emergencyPhone ?? ''),
-    startLocation: normalizeRoutineLocation(input?.startLocation),
-    destinationLocation: normalizeRoutineLocation(input?.destinationLocation),
-    childRoutePath: normalizeRoutePath(input?.childRoutePath),
-    startHour: input?.startHour ?? legacyStart.hour,
-    startMinute: input?.startMinute ?? legacyStart.minute,
-    destinationHour: input?.destinationHour ?? legacyDestination.hour,
-    destinationMinute: input?.destinationMinute ?? legacyDestination.minute,
+    startLocation: activeRoute?.start ?? normalizeRoutineLocation(input?.startLocation),
+    destinationLocation: activeRoute?.end ?? normalizeRoutineLocation(input?.destinationLocation),
+    childRoutePath: activeRoute?.waypoints ?? normalizeRoutePath(input?.childRoutePath),
+    savedRoutes: savedRoutes.map(route => ({
+      ...route,
+      isActive: route.id === activeRouteId,
+    })),
+    activeRouteId,
+    startHour: activeRoute?.startHour ?? input?.startHour ?? legacyStart.hour,
+    startMinute: activeRoute?.startMinute ?? input?.startMinute ?? legacyStart.minute,
+    destinationHour: activeRoute?.destinationHour ?? input?.destinationHour ?? legacyDestination.hour,
+    destinationMinute: activeRoute?.destinationMinute ?? input?.destinationMinute ?? legacyDestination.minute,
   };
 }
 
@@ -1923,20 +3700,217 @@ function normalizeRoutePath(input?: Partial<RoutePathPoint>[] | null): RoutePath
     }));
 }
 
+function normalizeSavedRoutes(input?: Partial<SavedRoute>[] | null): SavedRoute[] {
+  if (!Array.isArray(input)) {
+    return [];
+  }
+
+  return input
+    .slice(0, MAX_SAVED_ROUTES)
+    .map((route, index) => {
+      const start = normalizeRoutineLocation(route?.start);
+      const end = normalizeRoutineLocation(route?.end);
+      const waypoints = normalizeRoutePath(route?.waypoints);
+      if (!start || !end || waypoints.length === 0) {
+        return undefined;
+      }
+      const routeInfo = normalizeRouteInfoDraft(
+        route ?? {},
+        `\uC800\uC7A5 \uACBD\uB85C ${index + 1}`,
+      );
+      return {
+        id: typeof route?.id === 'string' && route.id ? route.id : `legacy-route-${index}`,
+        ...routeInfo,
+        isActive: Boolean(route?.isActive),
+        start,
+        end,
+        waypoints,
+      };
+    })
+    .filter((route): route is SavedRoute => Boolean(route));
+}
+
+function activateRouteInProfile(profile: SafetyProfile, routeId: string): SafetyProfile {
+  const selectedRoute = profile.savedRoutes.find(route => route.id === routeId);
+  if (!selectedRoute) {
+    return profile;
+  }
+
+  return {
+    ...profile,
+    savedRoutes: profile.savedRoutes.map(route => ({
+      ...route,
+      isActive: route.id === routeId,
+    })),
+    activeRouteId: routeId,
+    startLocation: selectedRoute.start,
+    destinationLocation: selectedRoute.end,
+    childRoutePath: selectedRoute.waypoints,
+    startHour: selectedRoute.startHour,
+    startMinute: selectedRoute.startMinute,
+    destinationHour: selectedRoute.destinationHour,
+    destinationMinute: selectedRoute.destinationMinute,
+  };
+}
+
+function addSavedRouteToProfile(profile: SafetyProfile, route: SavedRoute): SafetyProfile {
+  const savedRoutes = [
+    ...profile.savedRoutes.map(savedRoute => ({...savedRoute, isActive: false})),
+    route,
+  ].slice(-MAX_SAVED_ROUTES);
+
+  return {
+    ...profile,
+    savedRoutes,
+    activeRouteId: route.id,
+    startLocation: route.start,
+    destinationLocation: route.end,
+    childRoutePath: route.waypoints,
+    startHour: route.startHour,
+    startMinute: route.startMinute,
+    destinationHour: route.destinationHour,
+    destinationMinute: route.destinationMinute,
+  };
+}
+
+function updateSavedRouteInProfile(
+  profile: SafetyProfile,
+  routeId: string,
+  updates: Partial<SavedRoute>,
+): SafetyProfile {
+  let updatedActiveRoute: SavedRoute | undefined;
+  const savedRoutes = profile.savedRoutes.map(route => {
+    if (route.id !== routeId) {
+      return route;
+    }
+    const nextRoute = {
+      ...route,
+      ...updates,
+      ...(updates.name !== undefined ||
+      updates.startHour !== undefined ||
+      updates.startMinute !== undefined ||
+      updates.destinationHour !== undefined ||
+      updates.destinationMinute !== undefined
+        ? normalizeRouteInfoDraft({...route, ...updates}, route.name)
+        : {}),
+      waypoints: updates.waypoints ? normalizeRoutePath(updates.waypoints) : route.waypoints,
+    };
+    if (route.id === profile.activeRouteId) {
+      updatedActiveRoute = nextRoute;
+    }
+    return nextRoute;
+  });
+
+  if (!updatedActiveRoute) {
+    return {
+      ...profile,
+      savedRoutes,
+    };
+  }
+
+  return {
+    ...profile,
+    savedRoutes,
+    startLocation: updatedActiveRoute.start,
+    destinationLocation: updatedActiveRoute.end,
+    childRoutePath: updatedActiveRoute.waypoints,
+    startHour: updatedActiveRoute.startHour,
+    startMinute: updatedActiveRoute.startMinute,
+    destinationHour: updatedActiveRoute.destinationHour,
+    destinationMinute: updatedActiveRoute.destinationMinute,
+  };
+}
+
+function deleteSavedRouteFromProfile(profile: SafetyProfile, routeId: string): SafetyProfile {
+  const savedRoutes = profile.savedRoutes.filter(route => route.id !== routeId);
+  if (savedRoutes.length === profile.savedRoutes.length) {
+    return profile;
+  }
+
+  if (savedRoutes.length === 0) {
+    return {
+      ...profile,
+      savedRoutes: [],
+      activeRouteId: '',
+      startLocation: null,
+      destinationLocation: null,
+      childRoutePath: [],
+      startHour: '',
+      startMinute: '',
+      destinationHour: '',
+      destinationMinute: '',
+    };
+  }
+
+  if (profile.activeRouteId !== routeId) {
+    return {
+      ...profile,
+      savedRoutes,
+    };
+  }
+
+  const nextActiveRoute = savedRoutes[0];
+  return {
+    ...profile,
+    savedRoutes: savedRoutes.map(route => ({
+      ...route,
+      isActive: route.id === nextActiveRoute.id,
+    })),
+    activeRouteId: nextActiveRoute.id,
+    startLocation: nextActiveRoute.start,
+    destinationLocation: nextActiveRoute.end,
+    childRoutePath: nextActiveRoute.waypoints,
+    startHour: nextActiveRoute.startHour,
+    startMinute: nextActiveRoute.startMinute,
+    destinationHour: nextActiveRoute.destinationHour,
+    destinationMinute: nextActiveRoute.destinationMinute,
+  };
+}
+
+function routePointToRoutineLocation(
+  point: RoutePathPoint,
+  address: string,
+): RoutineLocation {
+  return {
+    latitude: point.latitude,
+    longitude: point.longitude,
+    address,
+  };
+}
+
+function createRouteId(seed = Date.now()) {
+  return `route-${Date.now()}-${seed}`;
+}
+
 function isKakaoKeyConfigured(key: string) {
   return key.trim().length > 0 && key !== 'YOUR_KAKAO_JAVASCRIPT_KEY';
 }
 
-function formatRoutineLocation(location: RoutineLocation) {
-  return `${location.address}\nlat ${location.latitude}, lng ${location.longitude}`;
-}
-
-function formatRoutePathSummary(path?: RoutePathPoint[]) {
-  if (!path || path.length === 0) {
+function formatSavedRouteSummary(routes: SavedRoute[], activeRouteId: string) {
+  if (routes.length === 0) {
     return '\uC800\uC7A5\uB41C \uACBD\uB85C \uC5C6\uC74C';
   }
+  const activeRoute = routes.find(route => route.id === activeRouteId);
+  if (!activeRoute) {
+    return `${routes.length}\uAC1C \uACBD\uB85C \uC800\uC7A5\uB428`;
+  }
+  return `${routes.length}\uAC1C \uACBD\uB85C \uC911 ${activeRoute.name} \uC0AC\uC6A9 \uC911`;
+}
 
-  return `${path.length}\uAC1C \uC9C0\uC810 \uC800\uC7A5\uB428`;
+function formatRouteTimeRange(route: Pick<SavedRoute, RouteScheduleKey>) {
+  const start = formatTimeLabel(route.startHour, route.startMinute);
+  const end = formatTimeLabel(route.destinationHour, route.destinationMinute);
+  if (!start && !end) {
+    return '\uC2DC\uAC04 \uBBF8\uC124\uC815';
+  }
+  return `${start || '--:--'}~${end || '--:--'}`;
+}
+
+function formatTimeLabel(hour: string, minute: string) {
+  if (!hour && !minute) {
+    return '';
+  }
+  return `${hour.padStart(2, '0')}:${(minute || '0').padStart(2, '0')}`;
 }
 
 function kakaoScriptUrl(kakaoKey: string) {
@@ -2500,6 +4474,335 @@ function buildKakaoRoutePickerHtml(
 </html>`;
 }
 
+function buildKakaoRoutePreviewHtml(kakaoKey: string, route: SavedRoute) {
+  const routePathJson = JSON.stringify(route.waypoints);
+  return `<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+  <style>
+    html, body, #map { width: 100%; height: 100%; margin: 0; padding: 0; }
+    body { background: #f3f4f6; overflow: hidden; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <script src="${kakaoScriptUrl(kakaoKey)}" onerror="window.__kakaoSdkLoadFailed = true"></script>
+  <script>
+    var routePoints = ${routePathJson};
+    var start = { latitude: ${route.start.latitude}, longitude: ${route.start.longitude} };
+    var end = { latitude: ${route.end.latitude}, longitude: ${route.end.longitude} };
+    ${kakaoSharedJs()}
+    function toLatLng(point) {
+      return new window.kakao.maps.LatLng(point.latitude, point.longitude);
+    }
+    function renderMap() {
+      var fallback = routePoints.length > 0 ? routePoints[0] : start;
+      var map = new window.kakao.maps.Map(document.getElementById('map'), { center: toLatLng(fallback), level: 4 });
+      var path = routePoints.length > 0 ? routePoints.map(toLatLng) : [toLatLng(start), toLatLng(end)];
+      new window.kakao.maps.Polyline({ map: map, path: path, strokeWeight: 5, strokeColor: '#2563eb', strokeOpacity: 0.9, strokeStyle: 'solid' });
+      new window.kakao.maps.Marker({ position: toLatLng(start), map: map });
+      new window.kakao.maps.Marker({ position: toLatLng(end), map: map });
+      var bounds = new window.kakao.maps.LatLngBounds();
+      path.forEach(function(point) { bounds.extend(point); });
+      bounds.extend(toLatLng(start));
+      bounds.extend(toLatLng(end));
+      setTimeout(function() { map.relayout(); map.setBounds(bounds); }, 200);
+    }
+    waitForKakaoSdk(function() { window.kakao.maps.load(renderMap); }, 0);
+  </script>
+</body>
+</html>`;
+}
+
+function buildKakaoRouteStatusHtml(
+  kakaoKey: string,
+  startLocation: RoutineLocation,
+  destinationLocation: RoutineLocation,
+  routePath: RoutePathPoint[],
+  currentLocation: EmergencyLocation,
+  routeDeviationDistanceMeters: number,
+  statusText: string,
+) {
+  const routePathJson = JSON.stringify(routePath);
+  const currentLocationJson = JSON.stringify(currentLocation);
+  const routeDeviationDistanceMetersJson = JSON.stringify(routeDeviationDistanceMeters);
+  const statusTextJson = JSON.stringify(statusText);
+  return `<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+  <style>
+    html, body, #map { width: 100%; height: 100%; margin: 0; padding: 0; }
+    body { background: #f3f4f6; overflow: hidden; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+    .currentOverlay { position: relative; width: 42px; height: 42px; }
+    .headingArrow { position: absolute; left: 9px; top: 1px; width: 0; height: 0; border-left: 12px solid transparent; border-right: 12px solid transparent; border-bottom: 30px solid rgba(37,99,235,0.92); transform-origin: 12px 20px; filter: drop-shadow(0 2px 4px rgba(15,23,42,0.25)); }
+    .centerDot { position: absolute; left: 13px; top: 13px; width: 10px; height: 10px; border: 4px solid #2563eb; border-radius: 50%; background: #ffffff; box-shadow: 0 2px 8px rgba(15,23,42,0.22); }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <script src="${kakaoScriptUrl(kakaoKey)}" onerror="window.__kakaoSdkLoadFailed = true"></script>
+  <script>
+    var map = null;
+    var currentCircle = null;
+    var currentOverlay = null;
+    var routePoints = ${routePathJson};
+    var start = { latitude: ${startLocation.latitude}, longitude: ${startLocation.longitude} };
+    var end = { latitude: ${destinationLocation.latitude}, longitude: ${destinationLocation.longitude} };
+    var current = ${currentLocationJson};
+    var routeDeviationDistanceMeters = ${routeDeviationDistanceMetersJson};
+    var statusText = ${statusTextJson};
+    ${kakaoSharedJs()}
+    function toLatLng(point) {
+      return new window.kakao.maps.LatLng(point.latitude, point.longitude);
+    }
+    function headingDegrees(point) {
+      return typeof point.heading === 'number' && isFinite(point.heading) ? point.heading : 0;
+    }
+    function currentOverlayHtml(point) {
+      return '<div class="currentOverlay"><div class="headingArrow" style="transform: rotate(' + headingDegrees(point) + 'deg);"></div><div class="centerDot"></div></div>';
+    }
+    function renderCurrentLocation(point, shouldPan) {
+      var currentLatLng = toLatLng(point);
+      if (!currentCircle) {
+        currentCircle = new window.kakao.maps.Circle({
+          map: map,
+          center: currentLatLng,
+          radius: routeDeviationDistanceMeters,
+          strokeWeight: 3,
+          strokeColor: statusText === '경로 이탈' ? '#dc2626' : '#16a34a',
+          strokeOpacity: 0.9,
+          fillColor: statusText === '경로 이탈' ? '#fecaca' : '#bbf7d0',
+          fillOpacity: 0.65
+        });
+      } else {
+        currentCircle.setPosition(currentLatLng);
+        currentCircle.setRadius(routeDeviationDistanceMeters);
+        if (typeof currentCircle.setOptions === 'function') {
+          currentCircle.setOptions({
+            strokeColor: statusText === '경로 이탈' ? '#dc2626' : '#16a34a',
+            fillColor: statusText === '경로 이탈' ? '#fecaca' : '#bbf7d0'
+          });
+        }
+      }
+      if (!currentOverlay) {
+        currentOverlay = new window.kakao.maps.CustomOverlay({
+          map: map,
+          position: currentLatLng,
+          content: currentOverlayHtml(point),
+          xAnchor: 0.5,
+          yAnchor: 0.5
+        });
+      } else {
+        currentOverlay.setPosition(currentLatLng);
+        currentOverlay.setContent(currentOverlayHtml(point));
+      }
+      if (shouldPan) {
+        map.panTo(currentLatLng);
+      }
+    }
+    window.updateCurrentLocation = function(nextLocation) {
+      current = nextLocation;
+      if (map) {
+        renderCurrentLocation(current, true);
+      }
+    };
+    window.updateRouteStatus = function(nextStatusText) {
+      statusText = nextStatusText;
+      if (map && current) {
+        renderCurrentLocation(current, false);
+      }
+    };
+    function renderMap() {
+      map = new window.kakao.maps.Map(document.getElementById('map'), { center: toLatLng(current), level: 4 });
+      var path = routePoints.length > 0 ? routePoints.map(toLatLng) : [toLatLng(start), toLatLng(end)];
+      new window.kakao.maps.Polyline({ map: map, path: path, strokeWeight: 5, strokeColor: '#2563eb', strokeOpacity: 0.9, strokeStyle: 'solid' });
+      new window.kakao.maps.Marker({ position: toLatLng(start), map: map });
+      new window.kakao.maps.Marker({ position: toLatLng(end), map: map });
+      var currentLatLng = toLatLng(current);
+      renderCurrentLocation(current, false);
+      var bounds = new window.kakao.maps.LatLngBounds();
+      path.forEach(function(point) { bounds.extend(point); });
+      bounds.extend(toLatLng(start));
+      bounds.extend(toLatLng(end));
+      bounds.extend(currentLatLng);
+      setTimeout(function() { map.relayout(); map.setBounds(bounds); }, 200);
+    }
+    waitForKakaoSdk(function() { window.kakao.maps.load(renderMap); }, 0);
+  </script>
+</body>
+</html>`;
+}
+
+function buildKakaoAutoRouteCaptureHtml(
+  kakaoKey: string,
+  phase: RouteCapturePhase,
+  startLocation: RoutineLocation,
+  endLocation: RoutineLocation,
+  waypoints: RoutePathPoint[],
+) {
+  const routePathJson = JSON.stringify(
+    (waypoints.length > 0 ? waypoints : [startLocation]).map(point => ({
+      latitude: point.latitude,
+      longitude: point.longitude,
+    })),
+  );
+  const isReview = phase === 'review';
+  const isConfirm = phase === 'confirm';
+
+  return `<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+  <style>${kakaoPickerCss()}</style>
+</head>
+<body>
+  <div id="mapScreen">
+    <div id="map"></div>
+  </div>
+  <script src="${kakaoScriptUrl(kakaoKey)}" onerror="window.__kakaoSdkLoadFailed = true"></script>
+  <script>
+    var map = null;
+    var polyline = null;
+    var markers = [];
+    var infoWindow = null;
+    var phase = '${phase}';
+    var isReview = ${isReview ? 'true' : 'false'};
+    var isConfirm = ${isConfirm ? 'true' : 'false'};
+    var routePoints = ${routePathJson};
+    var start = { latitude: ${startLocation.latitude}, longitude: ${startLocation.longitude} };
+    var end = { latitude: ${endLocation.latitude}, longitude: ${endLocation.longitude} };
+
+    ${kakaoSharedJs()}
+
+    function toLatLng(point) {
+      return new window.kakao.maps.LatLng(point.latitude, point.longitude);
+    }
+
+    function pointFromLatLng(latLng) {
+      return { latitude: latLng.getLat(), longitude: latLng.getLng() };
+    }
+
+    function clearMarkers() {
+      markers.forEach(function(marker) { marker.setMap(null); });
+      markers = [];
+      if (infoWindow) { infoWindow.close(); infoWindow = null; }
+    }
+
+    function postEditedRoute() {
+      post({
+        type: 'routeEdited',
+        waypoints: routePoints,
+        end: end
+      });
+    }
+
+    function postAdjustedStart() {
+      post({
+        type: 'routeStartAdjusted',
+        start: start
+      });
+    }
+
+    function updatePolyline() {
+      polyline.setPath(routePoints.map(toLatLng));
+    }
+
+    function deleteWaypoint(index) {
+      if (index <= 0 || index >= routePoints.length - 1) { return; }
+      routePoints.splice(index, 1);
+      clearMarkers();
+      updatePolyline();
+      renderMarkers();
+      postEditedRoute();
+    }
+    window.deleteWaypoint = deleteWaypoint;
+
+    function renderMarkers() {
+      clearMarkers();
+      routePoints.forEach(function(point, index) {
+        var isStart = index === 0;
+        var isEnd = index === routePoints.length - 1;
+        var marker = new window.kakao.maps.Marker({
+          position: toLatLng(point),
+          map: map,
+          draggable: (isReview && !isStart) || (isConfirm && isStart)
+        });
+        markers.push(marker);
+
+        if (isConfirm && isStart) {
+          window.kakao.maps.event.addListener(marker, 'click', function() {
+            if (infoWindow) { infoWindow.close(); }
+            infoWindow = new window.kakao.maps.InfoWindow({
+              content: '<div style="padding:8px;white-space:nowrap;font-size:13px;font-weight:800;">마커를 드래그해 출발지를 조정하세요</div>'
+            });
+            infoWindow.open(map, marker);
+          });
+          window.kakao.maps.event.addListener(marker, 'dragend', function() {
+            start = pointFromLatLng(marker.getPosition());
+            routePoints[0] = start;
+            updatePolyline();
+            postAdjustedStart();
+          });
+        }
+
+        if (isReview && !isStart && !isEnd) {
+          window.kakao.maps.event.addListener(marker, 'click', function() {
+            if (infoWindow) { infoWindow.close(); }
+            infoWindow = new window.kakao.maps.InfoWindow({
+              content: '<div style="padding:8px;white-space:nowrap;"><button type="button" onclick="window.deleteWaypoint(' + index + ')" style="height:32px;min-height:32px;border:0;border-radius:6px;background:#b91c1c;color:#fff;font-weight:900;">지점 삭제</button></div>'
+            });
+            infoWindow.open(map, marker);
+          });
+        }
+
+        if (isReview && !isStart) {
+          window.kakao.maps.event.addListener(marker, 'dragend', function() {
+            var movedPoint = pointFromLatLng(marker.getPosition());
+            routePoints[index] = movedPoint;
+            if (isEnd) {
+              end = movedPoint;
+            }
+            updatePolyline();
+            postEditedRoute();
+          });
+        }
+      });
+    }
+
+    function fitRouteBounds() {
+      var bounds = new window.kakao.maps.LatLngBounds();
+      routePoints.forEach(function(point) { bounds.extend(toLatLng(point)); });
+      map.setBounds(bounds);
+    }
+
+    function renderMap() {
+      if (routePoints.length === 0) {
+        routePoints = [start];
+      }
+      if (isReview && routePoints.length > 0) {
+        routePoints[routePoints.length - 1] = end;
+      }
+      var center = toLatLng(routePoints[routePoints.length - 1]);
+      map = new window.kakao.maps.Map(document.getElementById('map'), { center: center, level: 3 });
+      polyline = new window.kakao.maps.Polyline({ map: map, path: routePoints.map(toLatLng), strokeWeight: 5, strokeColor: '#2563eb', strokeOpacity: 0.9, strokeStyle: 'solid' });
+      renderMarkers();
+      setTimeout(function() {
+        map.relayout();
+        if (routePoints.length > 1) { fitRouteBounds(); } else { map.setCenter(center); }
+      }, 250);
+    }
+
+    waitForKakaoSdk(function() { window.kakao.maps.load(renderMap); }, 0);
+  </script>
+</body>
+</html>`;
+}
+
 function kakaoPickerCss() {
   return `html, body { margin: 0; width: 100%; height: 100%; min-height: 100%; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; color: #111827; overflow: auto; }
     body { background: #ffffff; }
@@ -2511,7 +4814,7 @@ function kakaoPickerCss() {
     .status { padding: 16px; color: #111827; font-size: 15px; line-height: 22px; }
     .pinConfirmPanel { position: absolute; left: 8px; top: 8px; z-index: 6; }
     .pinConfirmButton { width: 96px; height: 40px; min-height: 0; padding: 0; font-size: 14px; }
-    .mapPanel { position: absolute; left: 12px; right: 92px; top: 12px; z-index: 5; background: rgba(255,255,255,0.96); border: 1px solid #d1d5db; border-radius: 10px; padding: 12px; box-shadow: 0 8px 24px rgba(15,23,42,0.16); }
+    .mapPanel { position: absolute; left: 12px; right: 12px; bottom: 12px; z-index: 5; background: rgba(255,255,255,0.96); border: 1px solid #d1d5db; border-radius: 10px; padding: 12px; box-shadow: 0 8px 24px rgba(15,23,42,0.16); }
     .title { font-size: 15px; font-weight: 900; margin-bottom: 4px; }
     .desc { font-size: 13px; line-height: 18px; color: #4b5563; }
     .actions { display: flex; gap: 8px; margin-top: 10px; }
@@ -2555,6 +4858,15 @@ function formatAnalysisPass(pass?: string) {
   return pass;
 }
 
+function formatAnalysisSummary(analysis?: EmergencyAnalysis) {
+  return (
+    analysis?.audio_summary?.trim() ||
+    analysis?.decision_reason?.trim() ||
+    analysis?.recognized_dialogue?.trim() ||
+    undefined
+  );
+}
+
 function formatLocation(location?: {latitude: number; longitude: number}) {
   if (!location) {
     return undefined;
@@ -2574,6 +4886,31 @@ function formatAudioLogTime(value: string | number) {
   }
   return value;
 }
+
+function omitUnusedAnalysisLogFields<T extends Partial<EmergencyAnalysis>>(entry: T) {
+  const {
+    stt_context_used: _sttContextUsed,
+    situation_summary: _situationSummary,
+    ...rest
+  } = entry;
+  return rest;
+}
+
+function normalizeEmergencyLocation(input: unknown): EmergencyLocation | null {
+  if (!input || typeof input !== 'object') {
+    return null;
+  }
+  const location = input as Partial<EmergencyLocation>;
+  if (typeof location.latitude !== 'number' || typeof location.longitude !== 'number') {
+    return null;
+  }
+  return {
+    latitude: location.latitude,
+    longitude: location.longitude,
+    heading: typeof location.heading === 'number' ? location.heading : undefined,
+  };
+}
+
 async function requestAndroidPermissions() {
   if (Platform.OS !== 'android') {
     return;
@@ -2603,6 +4940,29 @@ async function requestAndroidPermissions() {
   }
 }
 
+async function requestAndroidLocationPermissions() {
+  if (Platform.OS !== 'android') {
+    return;
+  }
+
+  const permissions = [
+    PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
+    PermissionsAndroid.PERMISSIONS.ACCESS_COARSE_LOCATION,
+  ];
+  if (Platform.Version >= 33) {
+    permissions.push(PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS);
+  }
+
+  const result = await PermissionsAndroid.requestMultiple(permissions);
+  const denied = permissions.filter(
+    permission => result[permission] !== PermissionsAndroid.RESULTS.GRANTED,
+  );
+
+  if (denied.length > 0) {
+    throw new Error(`위치 수집 권한이 거부되었습니다: ${denied.join(', ')}`);
+  }
+}
+
 function monitoringModeLabel(mode: SafetyMode) {
   return mode === 'child'
     ? '\uC544\uB3D9 \uBCF4\uD638 \uBAA8\uB4DC'
@@ -2613,7 +4973,7 @@ function promptModeLabel(mode: SafetyMode) {
   return mode === 'child' ? '\uC544\uB3D9\uC6A9' : '\uC131\uC778\uC6A9';
 }
 
-function statusText(mode: string) {
+function statusText(mode: string, analysisPass?: 'primary' | 'secondary') {
   switch (mode) {
     case 'idle':
       return '대기 중';
@@ -2622,6 +4982,12 @@ function statusText(mode: string) {
     case 'monitoring':
       return '감시 중';
     case 'analyzing':
+      if (analysisPass === 'primary') {
+        return '1차 추론 중';
+      }
+      if (analysisPass === 'secondary') {
+        return '2차 추론 중';
+      }
       return '상황 분석 중';
     case 'countdown':
       return '신고 대기 카운트다운';
@@ -2663,6 +5029,22 @@ const styles = StyleSheet.create({
   profileHeaderText: {
     flex: 1,
     gap: 8,
+  },
+  profileHeaderTextWithAction: {
+    paddingRight: 112,
+  },
+  profileFloatingSaveButton: {
+    position: 'absolute',
+    top: 10,
+    right: 16,
+    zIndex: 10,
+    backgroundColor: '#111827',
+    borderRadius: 8,
+    minHeight: 42,
+    minWidth: 86,
+    paddingHorizontal: 18,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   inlineCloseButton: {
     backgroundColor: '#ffffff',
@@ -2732,6 +5114,9 @@ const styles = StyleSheet.create({
   },
   inputGroup: {
     gap: 6,
+  },
+  routeInfoEditor: {
+    gap: 10,
   },
   timeRow: {
     flexDirection: 'row',
@@ -2812,7 +5197,46 @@ const styles = StyleSheet.create({
   locationWebView: {
     flex: 1,
     backgroundColor: '#ffffff',
-  },  header: {
+  },
+  manualRouteInfoCard: {
+    width: '100%',
+    maxWidth: 420,
+    backgroundColor: '#ffffff',
+    borderRadius: 8,
+    padding: 18,
+    gap: 14,
+  },
+  routeCaptureConfirmCard: {
+    position: 'absolute',
+    left: 16,
+    right: 16,
+    top: 108,
+    backgroundColor: '#ffffff',
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    padding: 16,
+    gap: 14,
+  },
+  routeCaptureActionRow: {
+    flexDirection: 'row',
+    gap: 10,
+  },
+  routeCaptureActionButton: {
+    flex: 1,
+  },
+  routeCaptureBottomBar: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: '#ffffff',
+    borderTopWidth: 1,
+    borderTopColor: '#e5e7eb',
+    padding: 16,
+    gap: 12,
+  },
+  header: {
     gap: 8,
   },
   logButton: {
@@ -2852,6 +5276,42 @@ const styles = StyleSheet.create({
     gap: 8,
     borderWidth: 1,
     borderColor: '#e5e7eb',
+    position: 'relative',
+  },
+  routeDeviationBadgeButton: {
+    position: 'absolute',
+    right: 14,
+    top: 14,
+    minHeight: 26,
+    borderRadius: 7,
+    borderWidth: 1,
+    paddingHorizontal: 9,
+    justifyContent: 'center',
+  },
+  routeDeviationBadgeButtonChild: {
+    backgroundColor: '#fef2f2',
+    borderColor: '#fecaca',
+  },
+  routeDeviationBadgeButtonAdult: {
+    backgroundColor: '#fff7ed',
+    borderColor: '#fed7aa',
+  },
+  routeDeviationBadgeButtonMatched: {
+    backgroundColor: '#f0fdf4',
+    borderColor: '#bbf7d0',
+  },
+  routeDeviationBadge: {
+    fontSize: 12,
+    fontWeight: '900',
+  },
+  routeDeviationBadgeChild: {
+    color: '#dc2626',
+  },
+  routeDeviationBadgeAdult: {
+    color: '#f97316',
+  },
+  routeDeviationBadgeMatched: {
+    color: '#16a34a',
   },
   statusLabel: {
     color: '#6b7280',
@@ -2999,6 +5459,23 @@ const styles = StyleSheet.create({
     padding: 18,
     gap: 12,
   },
+  settingsCard: {
+    maxHeight: '88%',
+    padding: 0,
+    overflow: 'hidden',
+  },
+  settingsScrollContent: {
+    padding: 18,
+    gap: 12,
+  },
+  analysisWindowPanel: {
+    backgroundColor: '#ffffff',
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    padding: 14,
+    gap: 12,
+  },
   menuTitle: {
     color: '#111827',
     fontSize: 22,
@@ -3055,6 +5532,180 @@ const styles = StyleSheet.create({
     color: '#6b7280',
     fontSize: 12,
     lineHeight: 18,
+  },
+  secondsSlider: {
+    gap: 8,
+  },
+  secondsSliderHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 12,
+  },
+  secondsSliderLabel: {
+    color: '#374151',
+    fontSize: 13,
+    fontWeight: '800',
+  },
+  secondsSliderValue: {
+    color: '#111827',
+    fontSize: 14,
+    fontWeight: '900',
+  },
+  sliderTrack: {
+    height: 34,
+    borderRadius: 17,
+    backgroundColor: '#e5e7eb',
+    justifyContent: 'center',
+    overflow: 'visible',
+  },
+  sliderFill: {
+    position: 'absolute',
+    left: 0,
+    top: 13,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: '#2563eb',
+  },
+  sliderThumb: {
+    position: 'absolute',
+    top: 6,
+    width: 22,
+    height: 22,
+    marginLeft: -11,
+    borderRadius: 11,
+    backgroundColor: '#111827',
+    borderWidth: 3,
+    borderColor: '#ffffff',
+  },
+  sliderRangeLabels: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+  },
+  sliderRangeLabel: {
+    color: '#6b7280',
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  motionSensorFieldRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 12,
+  },
+  motionSensorFieldLabel: {
+    color: '#374151',
+    fontSize: 14,
+    fontWeight: '900',
+    flex: 1,
+  },
+  motionSensorInput: {
+    width: 96,
+    minHeight: 44,
+    backgroundColor: '#ffffff',
+    borderColor: '#d1d5db',
+    borderWidth: 1,
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    color: '#111827',
+    fontSize: 16,
+    fontWeight: '900',
+    textAlign: 'center',
+  },
+  motionSensorResetRow: {
+    alignItems: 'stretch',
+  },
+  motionSensorResetButton: {
+    minHeight: 44,
+  },
+  savedRoutePanel: {
+    backgroundColor: '#ffffff',
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    padding: 14,
+    gap: 10,
+  },
+  savedRouteOption: {
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#d1d5db',
+    backgroundColor: '#ffffff',
+    padding: 12,
+    minHeight: 58,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 10,
+  },
+  savedRouteOptionActive: {
+    backgroundColor: '#111827',
+    borderColor: '#111827',
+  },
+  savedRouteOptionText: {
+    flex: 1,
+    gap: 4,
+  },
+  savedRouteName: {
+    color: '#111827',
+    fontSize: 15,
+    fontWeight: '900',
+  },
+  savedRouteNameActive: {
+    color: '#ffffff',
+  },
+  savedRouteMeta: {
+    color: '#6b7280',
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  savedRouteMetaActive: {
+    color: '#d1d5db',
+  },
+  savedRouteBadge: {
+    color: '#111827',
+    fontSize: 13,
+    fontWeight: '900',
+  },
+  savedRouteBadgeActive: {
+    color: '#ffffff',
+  },
+  routeManagerHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 10,
+  },
+  routeManagerItem: {
+    borderTopWidth: 1,
+    borderTopColor: '#e5e7eb',
+    paddingTop: 12,
+    gap: 12,
+  },
+  routeManagerSummary: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 10,
+  },
+  routeManagerActiveBadge: {
+    color: '#2563eb',
+  },
+  routeManagerEditor: {
+    gap: 12,
+  },
+  routePreviewWebView: {
+    height: 180,
+    borderRadius: 8,
+    backgroundColor: '#f3f4f6',
+    overflow: 'hidden',
+  },
+  routeManagerActionRow: {
+    flexDirection: 'row',
+    gap: 10,
+  },
+  routeManagerActionButton: {
+    flex: 1,
   },
   thresholdPanel: {
     backgroundColor: '#ffffff',
@@ -3128,6 +5779,11 @@ const styles = StyleSheet.create({
   },
   routeHeaderText: {
     flex: 1,
+  },
+  routeHeaderActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
   },
   backButton: {
     backgroundColor: '#ffffff',

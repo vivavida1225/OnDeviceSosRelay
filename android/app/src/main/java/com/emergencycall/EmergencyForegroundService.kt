@@ -14,12 +14,15 @@ import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.location.Location
+import android.location.LocationListener
 import android.location.LocationManager
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.os.Build
+import android.os.Bundle
 import android.os.IBinder
+import android.os.Looper
 import android.os.SystemClock
 import android.util.Base64
 import android.util.Log
@@ -27,10 +30,14 @@ import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.WritableMap
+import org.json.JSONArray
 import kotlin.concurrent.thread
+import kotlin.math.cos
+import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.sqrt
 
-class EmergencyForegroundService : Service(), SensorEventListener {
+class EmergencyForegroundService : Service(), SensorEventListener, LocationListener {
   private var sensorManager: SensorManager? = null
   private var locationManager: LocationManager? = null
   private var audioRecord: AudioRecord? = null
@@ -39,7 +46,17 @@ class EmergencyForegroundService : Service(), SensorEventListener {
   private var triggerLocked = false
   private var ringWriteIndex = 0
   private var sensorThreshold = 28.0
+  private var gyroThreshold = 8.0
   private var audioRmsThreshold = 0.35
+  private var preTriggerSeconds = DEFAULT_PRE_TRIGGER_SECONDS
+  private var postTriggerSeconds = DEFAULT_POST_TRIGGER_SECONDS
+  private var routeDeviationDistanceMeters = DEFAULT_ROUTE_DEVIATION_DISTANCE_METERS
+  private var routeDeviationDurationSeconds = DEFAULT_ROUTE_DEVIATION_DURATION_SECONDS
+  private var routeDeviationStartedAtMs = 0L
+  private var routeDeviation = false
+  private var routeDeviationStatusEmitted = false
+  private var routeDeviationTrackingEnabled = false
+  private var lastRouteDistanceMeters = -1.0
   private var sttEngine = SherpaOnnxMoonshineSttAnalyzer.ENGINE_OFF
   private var customPrompt = ""
   private var monitoringMode = GemmaPromptStore.MODE_ADULT
@@ -49,8 +66,9 @@ class EmergencyForegroundService : Service(), SensorEventListener {
   private var lastAudioReadAtMs = 0L
   private var totalReadSamples = 0L
   private val sampleRate = 16000
-  private val ringBuffer = ShortArray(sampleRate * 10)
+  private val ringBuffer = ShortArray(sampleRate * MAX_ANALYSIS_WINDOW_SECONDS)
   private val ringLock = Object()
+  private var routePath = emptyList<RouteDeviationPoint>()
 
   override fun onBind(intent: Intent?): IBinder? = null
 
@@ -66,7 +84,7 @@ class EmergencyForegroundService : Service(), SensorEventListener {
       ACTION_START -> startMonitoring(intent)
       ACTION_STOP -> stopMonitoring()
       ACTION_CANCEL -> cancelPendingReport()
-      ACTION_DEV_TRIGGER -> triggerEmergency("dev", DEV_TRIGGER_POST_CAPTURE_MS)
+      ACTION_DEV_TRIGGER -> triggerEmergency("dev")
     }
     return START_STICKY
   }
@@ -85,22 +103,49 @@ class EmergencyForegroundService : Service(), SensorEventListener {
       },
     )
     val isAccelerometerSpike = event.sensor.type == Sensor.TYPE_ACCELEROMETER && magnitude > sensorThreshold
-    val isGyroSpike = event.sensor.type == Sensor.TYPE_GYROSCOPE && magnitude > 8.0
+    val isGyroSpike = event.sensor.type == Sensor.TYPE_GYROSCOPE && magnitude > gyroThreshold
     if (isAccelerometerSpike || isGyroSpike) {
-      triggerEmergency("sensor", 0)
+      triggerEmergency("sensor")
     }
   }
 
   override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
 
+  override fun onLocationChanged(location: Location) {
+    if (!monitoring || !routeDeviationTrackingEnabled) return
+    updateRouteDeviation(location)
+  }
+
+  @Deprecated("Deprecated in Android API")
+  override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) = Unit
+
+  override fun onProviderEnabled(provider: String) = Unit
+
+  override fun onProviderDisabled(provider: String) = Unit
+
   private fun startMonitoring(intent: Intent) {
     sensorThreshold = intent.getDoubleExtra(EXTRA_SENSOR_THRESHOLD, 28.0)
+    gyroThreshold = intent.getDoubleExtra(EXTRA_GYRO_THRESHOLD, 8.0)
     audioRmsThreshold = intent.getDoubleExtra(EXTRA_AUDIO_RMS_THRESHOLD, 0.35)
+    preTriggerSeconds = intent.getIntExtra(EXTRA_PRE_TRIGGER_SECONDS, DEFAULT_PRE_TRIGGER_SECONDS)
+      .coerceIn(MIN_ANALYSIS_WINDOW_SECONDS, MAX_ANALYSIS_WINDOW_SECONDS)
+    postTriggerSeconds = intent.getIntExtra(EXTRA_POST_TRIGGER_SECONDS, DEFAULT_POST_TRIGGER_SECONDS)
+      .coerceIn(MIN_ANALYSIS_WINDOW_SECONDS, MAX_ANALYSIS_WINDOW_SECONDS)
     sttEngine = intent.getStringExtra(EXTRA_STT_ENGINE)
       ?: if (intent.getBooleanExtra(EXTRA_STT_ENABLED, false)) SherpaOnnxMoonshineSttAnalyzer.ENGINE_MOONSHINE_TINY_KO else SherpaOnnxMoonshineSttAnalyzer.ENGINE_OFF
     customPrompt = intent.getStringExtra(EXTRA_CUSTOM_PROMPT) ?: ""
     monitoringMode = GemmaPromptStore.normalizeMode(intent.getStringExtra(EXTRA_MONITORING_MODE))
-    Log.i(TAG, "startMonitoring: sttEngine=$sttEngine monitoringMode=$monitoringMode")
+    routeDeviationDistanceMeters = intent.getIntExtra(EXTRA_ROUTE_DEVIATION_DISTANCE_METERS, DEFAULT_ROUTE_DEVIATION_DISTANCE_METERS)
+      .coerceAtLeast(1)
+    routeDeviationDurationSeconds = intent.getIntExtra(EXTRA_ROUTE_DEVIATION_DURATION_SECONDS, DEFAULT_ROUTE_DEVIATION_DURATION_SECONDS)
+      .coerceAtLeast(1)
+    routePath = parseRoutePath(intent.getStringExtra(EXTRA_ROUTE_PATH_JSON))
+    routeDeviationTrackingEnabled = routePath.size >= 2
+    routeDeviationStatusEmitted = false
+    if (!routeDeviationTrackingEnabled) {
+      setRouteDeviation(false, -1.0, 0)
+    }
+    Log.i(TAG, "startMonitoring: sttEngine=$sttEngine monitoringMode=$monitoringMode sensorThreshold=$sensorThreshold gyroThreshold=$gyroThreshold preTriggerSeconds=$preTriggerSeconds postTriggerSeconds=$postTriggerSeconds routeDeviationDistanceMeters=$routeDeviationDistanceMeters routeDeviationDurationSeconds=$routeDeviationDurationSeconds routePathPoints=${routePath.size}")
     val modelId = intent.getStringExtra(EXTRA_MODEL_ID) ?: "gemma-4-E4B-it"
     Log.i(TAG, "startMonitoring: warmUp requested modelId=$modelId monitoring=$monitoring")
     val warmUpResult = LiteRtGemmaAnalyzer.warmUp(this, modelId)
@@ -108,6 +153,7 @@ class EmergencyForegroundService : Service(), SensorEventListener {
 
     if (monitoring) {
       triggerLocked = false
+      restartRouteDeviationUpdates()
       val event = Arguments.createMap()
       event.putString("status", "monitoring")
       event.putString("reason", "already_monitoring_rearmed")
@@ -121,6 +167,7 @@ class EmergencyForegroundService : Service(), SensorEventListener {
     monitoring = true
     triggerLocked = false
     startSensors()
+    restartRouteDeviationUpdates()
     startAudioCapture()
 
     val event = Arguments.createMap()
@@ -134,6 +181,11 @@ class EmergencyForegroundService : Service(), SensorEventListener {
     monitoring = false
     triggerLocked = false
     sensorManager?.unregisterListener(this)
+    runCatching { locationManager?.removeUpdates(this) }
+    setRouteDeviation(false, -1.0, 0)
+    routeDeviationTrackingEnabled = false
+    routeDeviationStartedAtMs = 0L
+    routeDeviationStatusEmitted = false
     audioRecord?.stopSafely()
     audioRecord?.release()
     audioRecord = null
@@ -159,6 +211,144 @@ class EmergencyForegroundService : Service(), SensorEventListener {
     accelerometer?.let { sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
     gyroscope?.let { sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
   }
+
+  private fun restartRouteDeviationUpdates() {
+    runCatching { locationManager?.removeUpdates(this) }
+    routeDeviationStartedAtMs = 0L
+    if (!monitoring || !routeDeviationTrackingEnabled) {
+      return
+    }
+    if (!hasLocationPermission()) {
+      emitNativeError("ROUTE_DEVIATION_LOCATION_DENIED", "Location permission is not granted.")
+      return
+    }
+
+    val manager = locationManager ?: return
+    val providers = listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)
+    providers.forEach { provider ->
+      runCatching {
+        if (manager.isProviderEnabled(provider)) {
+          manager.requestLocationUpdates(
+            provider,
+            ROUTE_DEVIATION_LOCATION_INTERVAL_MS,
+            0f,
+            this,
+            Looper.getMainLooper(),
+          )
+        }
+      }
+    }
+    providers
+      .mapNotNull { provider -> runCatching { manager.getLastKnownLocation(provider) }.getOrNull() }
+      .maxByOrNull { it.time }
+      ?.let { updateRouteDeviation(it) }
+  }
+
+  private fun updateRouteDeviation(location: Location) {
+    if (!isRouteLocationUsable(location)) {
+      return
+    }
+    val distanceMeters = distanceToRouteMeters(location)
+    val now = SystemClock.elapsedRealtime()
+    if (distanceMeters >= routeDeviationDistanceMeters) {
+      if (routeDeviationStartedAtMs == 0L) {
+        routeDeviationStartedAtMs = now
+      }
+      val durationSeconds = ((now - routeDeviationStartedAtMs) / 1000L).toInt()
+      if (durationSeconds >= routeDeviationDurationSeconds) {
+        setRouteDeviation(true, distanceMeters, durationSeconds)
+      }
+      return
+    }
+
+    routeDeviationStartedAtMs = 0L
+    setRouteDeviation(false, distanceMeters, 0)
+  }
+
+  private fun setRouteDeviation(nextDeviation: Boolean, distanceMeters: Double, durationSeconds: Int) {
+    if (routeDeviationStatusEmitted && routeDeviation == nextDeviation) {
+      return
+    }
+    lastRouteDistanceMeters = distanceMeters
+    routeDeviation = nextDeviation
+    routeDeviationStatusEmitted = true
+    val event = Arguments.createMap().apply {
+      putBoolean("route_deviation", nextDeviation)
+      putDouble("distance_meters", distanceMeters)
+      putInt("threshold_meters", routeDeviationDistanceMeters)
+      putInt("duration_seconds", durationSeconds)
+    }
+    EmergencyEventBus.emit("routeDeviationStatus", event)
+  }
+
+  private fun isRouteLocationUsable(location: Location): Boolean =
+    location.hasAccuracy() && location.accuracy <= MAX_ROUTE_LOCATION_ACCURACY_METERS
+
+  private fun hasLocationPermission(): Boolean =
+    ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+      ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+
+  private fun distanceToRouteMeters(location: Location): Double {
+    if (routePath.isEmpty()) return Double.MAX_VALUE
+    if (routePath.size == 1) return distanceMeters(routePath.first(), location)
+    return routePath
+      .zipWithNext()
+      .minOf { (start, end) -> distanceToSegmentMeters(location, start, end) }
+  }
+
+  private fun distanceToSegmentMeters(location: Location, start: RouteDeviationPoint, end: RouteDeviationPoint): Double {
+    val originLatRadians = Math.toRadians(location.latitude)
+    val currentX = 0.0
+    val currentY = 0.0
+    val startX = longitudeDeltaToMeters(start.longitude - location.longitude, originLatRadians)
+    val startY = latitudeDeltaToMeters(start.latitude - location.latitude)
+    val endX = longitudeDeltaToMeters(end.longitude - location.longitude, originLatRadians)
+    val endY = latitudeDeltaToMeters(end.latitude - location.latitude)
+    val segmentX = endX - startX
+    val segmentY = endY - startY
+    val segmentLengthSquared = segmentX * segmentX + segmentY * segmentY
+    if (segmentLengthSquared == 0.0) {
+      return sqrt((startX * startX) + (startY * startY))
+    }
+    val projection = (((currentX - startX) * segmentX) + ((currentY - startY) * segmentY)) / segmentLengthSquared
+    val clamped = min(1.0, max(0.0, projection))
+    val closestX = startX + clamped * segmentX
+    val closestY = startY + clamped * segmentY
+    return sqrt((closestX * closestX) + (closestY * closestY))
+  }
+
+  private fun latitudeDeltaToMeters(deltaDegrees: Double): Double =
+    Math.toRadians(deltaDegrees) * EARTH_RADIUS_METERS
+
+  private fun longitudeDeltaToMeters(deltaDegrees: Double, latitudeRadians: Double): Double =
+    Math.toRadians(deltaDegrees) * EARTH_RADIUS_METERS * cos(latitudeRadians)
+
+  private fun distanceMeters(point: RouteDeviationPoint, location: Location): Double {
+    val results = FloatArray(1)
+    Location.distanceBetween(
+      point.latitude,
+      point.longitude,
+      location.latitude,
+      location.longitude,
+      results,
+    )
+    return results[0].toDouble()
+  }
+
+  private fun parseRoutePath(routePathJson: String?): List<RouteDeviationPoint> =
+    runCatching {
+      val json = JSONArray(routePathJson ?: "[]")
+      buildList {
+        for (index in 0 until json.length()) {
+          val point = json.optJSONObject(index) ?: continue
+          val latitude = point.optDouble("latitude", Double.NaN)
+          val longitude = point.optDouble("longitude", Double.NaN)
+          if (!latitude.isNaN() && !longitude.isNaN()) {
+            add(RouteDeviationPoint(latitude, longitude))
+          }
+        }
+      }
+    }.getOrDefault(emptyList())
 
   private fun startAudioCapture() {
     if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
@@ -194,7 +384,7 @@ class EmergencyForegroundService : Service(), SensorEventListener {
           totalReadSamples += read
           appendAudio(buffer, read)
           if (!triggerLocked && currentRms > audioRmsThreshold) {
-            triggerEmergency("audio", 0)
+            triggerEmergency("audio")
           }
         }
       }
@@ -210,13 +400,20 @@ class EmergencyForegroundService : Service(), SensorEventListener {
     }
   }
 
-  private fun triggerEmergency(source: String, postCaptureMs: Int) {
+  private fun triggerEmergency(source: String) {
     if (!monitoring || triggerLocked) return
     triggerLocked = true
+    val preCaptureSeconds = preTriggerSeconds
+    val postCaptureSeconds = postTriggerSeconds
+    val preTriggerSamples = sampleRate * preCaptureSeconds
+    val postCaptureMs = postCaptureSeconds * 1000
+    val routeDeviationAtTrigger = routeDeviation
 
     val triggerEvent = Arguments.createMap()
     triggerEvent.putString("source", source)
-    triggerEvent.putInt("post_capture_ms", SECONDARY_POST_CAPTURE_MS)
+    triggerEvent.putInt("pre_trigger_seconds", preCaptureSeconds)
+    triggerEvent.putInt("post_capture_ms", postCaptureMs)
+    triggerEvent.putBoolean("route_deviation", routeDeviationAtTrigger)
     EmergencyEventBus.emit("triggerDetected", triggerEvent)
 
     val status = Arguments.createMap()
@@ -225,7 +422,7 @@ class EmergencyForegroundService : Service(), SensorEventListener {
 
     thread(name = "EmergencyAnalysis") {
       val location = currentLocation()
-      val primarySnapshot = readRingBufferSnapshot()
+      val primarySnapshot = readRingBufferSnapshot(preTriggerSamples)
       saveAudioLog(source, PRIMARY_ANALYSIS_PASS, primarySnapshot)?.let {
         emitAudioLogSaved("1차 추론 오디오 로그 저장 완료", source, PRIMARY_ANALYSIS_PASS, it)
       }
@@ -237,6 +434,7 @@ class EmergencyForegroundService : Service(), SensorEventListener {
           putString("trigger_source", source)
           putString("analysis_pass", PRIMARY_ANALYSIS_PASS)
           putString("analysis_audio_role", "primary_pre_trigger")
+          putBoolean("route_deviation", routeDeviationAtTrigger)
           putAudioSnapshotFields(primarySnapshot, location, 0)
         },
       )
@@ -246,14 +444,14 @@ class EmergencyForegroundService : Service(), SensorEventListener {
         emitAnalysisDebug(
           "secondary_capture_started",
           Arguments.createMap().apply {
-            putString("message", "2차 추론용 트리거 이후 7초 녹음 시작")
+            putString("message", "2차 추론용 트리거 이후 ${postCaptureSeconds}초 녹음 시작")
             putString("trigger_source", source)
             putString("analysis_pass", SECONDARY_ANALYSIS_PASS)
-            putInt("post_capture_ms", SECONDARY_POST_CAPTURE_MS)
+            putInt("post_capture_ms", postCaptureMs)
           },
         )
-        SystemClock.sleep(SECONDARY_POST_CAPTURE_MS.toLong())
-        postTriggerSnapshot = readRingBufferSnapshot((sampleRate * SECONDARY_POST_CAPTURE_MS) / 1000).also { snapshot ->
+        SystemClock.sleep(postCaptureMs.toLong())
+        postTriggerSnapshot = readRingBufferSnapshot((sampleRate * postCaptureMs) / 1000).also { snapshot ->
           emitAnalysisDebug(
             "secondary_audio_captured",
             Arguments.createMap().apply {
@@ -261,8 +459,8 @@ class EmergencyForegroundService : Service(), SensorEventListener {
               putString("trigger_source", source)
               putString("analysis_pass", SECONDARY_ANALYSIS_PASS)
               putString("analysis_audio_role", "secondary_post_trigger")
-              putInt("post_capture_ms", SECONDARY_POST_CAPTURE_MS)
-              putAudioSnapshotFields(snapshot, location, SECONDARY_POST_CAPTURE_MS)
+              putInt("post_capture_ms", postCaptureMs)
+              putAudioSnapshotFields(snapshot, location, postCaptureMs)
             },
           )
         }
@@ -275,6 +473,7 @@ class EmergencyForegroundService : Service(), SensorEventListener {
           putString("trigger_source", source)
           putString("analysis_pass", PRIMARY_ANALYSIS_PASS)
           putBoolean("stt_context_used", false)
+          putBoolean("route_deviation", routeDeviationAtTrigger)
           putString("monitoring_mode", monitoringMode)
         },
       )
@@ -291,6 +490,9 @@ class EmergencyForegroundService : Service(), SensorEventListener {
         analysisPass = PRIMARY_ANALYSIS_PASS,
         previousContext = "",
         monitoringMode = monitoringMode,
+        preTriggerSeconds = preCaptureSeconds,
+        postTriggerSeconds = postCaptureSeconds,
+        routeDeviation = routeDeviationAtTrigger,
       )
       val primaryEmergency = primaryResult.getBoolean("is_emergency")
       decorateAnalysisResult(primaryResult, PRIMARY_ANALYSIS_PASS, finalDecision = primaryEmergency, sttResult = null)
@@ -304,7 +506,7 @@ class EmergencyForegroundService : Service(), SensorEventListener {
       }
 
       postCaptureThread.join()
-      val secondarySnapshot = postTriggerSnapshot ?: readRingBufferSnapshot((sampleRate * SECONDARY_POST_CAPTURE_MS) / 1000)
+      val secondarySnapshot = postTriggerSnapshot ?: readRingBufferSnapshot((sampleRate * postCaptureMs) / 1000)
       saveAudioLog(source, SECONDARY_ANALYSIS_PASS, secondarySnapshot)?.let {
         emitAudioLogSaved("2차 추론 오디오 로그 저장 완료", source, SECONDARY_ANALYSIS_PASS, it)
       }
@@ -319,6 +521,7 @@ class EmergencyForegroundService : Service(), SensorEventListener {
           putString("analysis_pass", SECONDARY_ANALYSIS_PASS)
           putString("previous_primary_context", primaryContext)
           putBoolean("stt_context_used", false)
+          putBoolean("route_deviation", routeDeviationAtTrigger)
           putString("monitoring_mode", monitoringMode)
           sttResult.error?.let { putString("stt_error", it) }
         },
@@ -336,6 +539,9 @@ class EmergencyForegroundService : Service(), SensorEventListener {
         analysisPass = SECONDARY_ANALYSIS_PASS,
         previousContext = primaryContext,
         monitoringMode = monitoringMode,
+        preTriggerSeconds = preCaptureSeconds,
+        postTriggerSeconds = postCaptureSeconds,
+        routeDeviation = routeDeviationAtTrigger,
       )
       decorateAnalysisResult(secondaryResult, SECONDARY_ANALYSIS_PASS, finalDecision = true, sttResult = sttResult)
       secondaryResult.putString("previous_primary_context", primaryContext)
@@ -436,6 +642,9 @@ class EmergencyForegroundService : Service(), SensorEventListener {
     result.putString("analysis_pass", analysisPass)
     result.putString("monitoring_mode", monitoringMode)
     result.putBoolean("final_decision", finalDecision)
+    if (!result.hasKey("route_deviation")) {
+      result.putBoolean("route_deviation", routeDeviation)
+    }
     result.putBoolean("stt_context_used", false)
     result.putString("stt_transcript", sttResult?.transcript ?: "")
     result.putString("stt_engine", sttResult?.engine ?: SherpaOnnxMoonshineSttAnalyzer.ENGINE_OFF)
@@ -449,7 +658,8 @@ class EmergencyForegroundService : Service(), SensorEventListener {
     val dialogue = if (result.hasKey("recognized_dialogue")) result.getString("recognized_dialogue") else ""
     val summary = if (result.hasKey("audio_summary")) result.getString("audio_summary") else ""
     val reason = if (result.hasKey("decision_reason")) result.getString("decision_reason") else ""
-    return "1차 추론 결과: is_emergency=$emergency, confidence=$confidence, crime_type=$crimeType, recognized_dialogue=$dialogue, audio_summary=$summary, decision_reason=$reason"
+    val routeDeviationContext = safeBoolean(result, "route_deviation", false)
+    return "1차 추론 결과: is_emergency=$emergency, confidence=$confidence, crime_type=$crimeType, route_deviation=$routeDeviationContext, recognized_dialogue=$dialogue, audio_summary=$summary, decision_reason=$reason"
   }
 
   private fun emitAiCompletedDebug(
@@ -471,6 +681,7 @@ class EmergencyForegroundService : Service(), SensorEventListener {
         putInt("elapsed_ms", elapsedMs)
         putBoolean("is_emergency", safeBoolean(result, "is_emergency", false))
         putBoolean("final_decision", finalDecision)
+        putBoolean("route_deviation", safeBoolean(result, "route_deviation", false))
         putBoolean("stt_context_used", false)
         putString("crime_type", safeString(result, "crime_type"))
         putString("situation_summary", safeString(result, "situation_summary"))
@@ -501,6 +712,7 @@ class EmergencyForegroundService : Service(), SensorEventListener {
       putString("confidence", safeString(result, "confidence"))
       putString("analysis_pass", safeString(result, "analysis_pass"))
       putString("monitoring_mode", safeString(result, "monitoring_mode", monitoringMode))
+      putBoolean("route_deviation", safeBoolean(result, "route_deviation", false))
       putBoolean("final_decision", safeBoolean(result, "final_decision", false))
       putString("audio_summary", safeString(result, "audio_summary"))
       putBoolean("stt_context_used", safeBoolean(result, "stt_context_used", false))
@@ -752,7 +964,13 @@ class EmergencyForegroundService : Service(), SensorEventListener {
     const val ACTION_CANCEL = "com.emergencycall.CANCEL_PENDING_REPORT"
     const val ACTION_DEV_TRIGGER = "com.emergencycall.DEV_TRIGGER"
     const val EXTRA_SENSOR_THRESHOLD = "sensorThreshold"
+    const val EXTRA_GYRO_THRESHOLD = "gyroThreshold"
     const val EXTRA_AUDIO_RMS_THRESHOLD = "audioRmsThreshold"
+    const val EXTRA_PRE_TRIGGER_SECONDS = "preTriggerSeconds"
+    const val EXTRA_POST_TRIGGER_SECONDS = "postTriggerSeconds"
+    const val EXTRA_ROUTE_DEVIATION_DISTANCE_METERS = "routeDeviationDistanceMeters"
+    const val EXTRA_ROUTE_DEVIATION_DURATION_SECONDS = "routeDeviationDurationSeconds"
+    const val EXTRA_ROUTE_PATH_JSON = "routePathJson"
     const val EXTRA_MODEL_ID = "modelId"
     const val EXTRA_STT_ENABLED = "sttEnabled"
     const val EXTRA_STT_ENGINE = "sttEngine"
@@ -762,8 +980,15 @@ class EmergencyForegroundService : Service(), SensorEventListener {
     private const val CHANNEL_ID = "emergency_monitoring"
     private const val NOTIFICATION_ID = 11201
     private const val AUDIO_NON_SILENT_THRESHOLD = 128
-    private const val DEV_TRIGGER_POST_CAPTURE_MS = 0
-    private const val SECONDARY_POST_CAPTURE_MS = 7000
+    private const val MIN_ANALYSIS_WINDOW_SECONDS = 1
+    private const val MAX_ANALYSIS_WINDOW_SECONDS = 30
+    private const val DEFAULT_PRE_TRIGGER_SECONDS = 10
+    private const val DEFAULT_POST_TRIGGER_SECONDS = 7
+    private const val DEFAULT_ROUTE_DEVIATION_DISTANCE_METERS = 50
+    private const val DEFAULT_ROUTE_DEVIATION_DURATION_SECONDS = 20
+    private const val ROUTE_DEVIATION_LOCATION_INTERVAL_MS = 5_000L
+    private const val MAX_ROUTE_LOCATION_ACCURACY_METERS = 50.0f
+    private const val EARTH_RADIUS_METERS = 6_371_000.0
     private const val PRIMARY_ANALYSIS_PASS = "primary"
     private const val SECONDARY_ANALYSIS_PASS = "secondary"
     private const val VAD_TRIM_PADDING_MS = 500
@@ -789,4 +1014,9 @@ private data class AudioSnapshot(
   val firstNonSilentOffsetMs: Int,
   val lastNonSilentOffsetMs: Int,
   val lastAudioReadAgeMs: Int,
+)
+
+private data class RouteDeviationPoint(
+  val latitude: Double,
+  val longitude: Double,
 )

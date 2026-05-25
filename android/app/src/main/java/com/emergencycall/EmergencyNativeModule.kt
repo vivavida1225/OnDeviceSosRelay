@@ -4,9 +4,19 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.location.Address
 import android.location.Geocoder
+import android.location.Location
+import android.location.LocationListener
+import android.location.LocationManager
 import android.os.Build
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.telephony.SmsManager
 import androidx.core.content.ContextCompat
 import com.facebook.react.bridge.Arguments
@@ -16,6 +26,8 @@ import com.facebook.react.bridge.ReactContextBaseJavaModule
 import com.facebook.react.bridge.ReactMethod
 import com.facebook.react.bridge.ReadableMap
 import com.facebook.react.bridge.UiThreadUtil
+import org.json.JSONArray
+import org.json.JSONObject
 import java.util.Locale
 
 class EmergencyNativeModule(
@@ -26,6 +38,14 @@ class EmergencyNativeModule(
   private val preferences by lazy {
     reactContext.getSharedPreferences("onguard_ai_prefs", Context.MODE_PRIVATE)
   }
+  private val mainHandler = Handler(Looper.getMainLooper())
+  private var routeStatusLocationManager: LocationManager? = null
+  private var routeStatusLocationListener: LocationListener? = null
+  private var routeStatusSensorManager: SensorManager? = null
+  private var routeStatusSensorListener: SensorEventListener? = null
+  private var routeStatusLastLocation: Location? = null
+  private var routeStatusHeading: Double? = null
+  private var routeStatusLastHeadingEmitAt = 0L
 
   init {
     SherpaOnnxMoonshineSttAnalyzer.ensureModelDirectories(reactContext)
@@ -41,8 +61,32 @@ class EmergencyNativeModule(
         if (config.hasKey("sensorThreshold")) config.getDouble("sensorThreshold") else 28.0,
       )
       putExtra(
+        EmergencyForegroundService.EXTRA_GYRO_THRESHOLD,
+        if (config.hasKey("gyroThreshold")) config.getDouble("gyroThreshold") else 8.0,
+      )
+      putExtra(
         EmergencyForegroundService.EXTRA_AUDIO_RMS_THRESHOLD,
         if (config.hasKey("audioRmsThreshold")) config.getDouble("audioRmsThreshold") else 0.35,
+      )
+      putExtra(
+        EmergencyForegroundService.EXTRA_PRE_TRIGGER_SECONDS,
+        analysisWindowSeconds(config, "preTriggerSeconds", 10),
+      )
+      putExtra(
+        EmergencyForegroundService.EXTRA_POST_TRIGGER_SECONDS,
+        analysisWindowSeconds(config, "postTriggerSeconds", 7),
+      )
+      putExtra(
+        EmergencyForegroundService.EXTRA_ROUTE_DEVIATION_DISTANCE_METERS,
+        positiveInt(config, "routeDeviationDistanceMeters", 50),
+      )
+      putExtra(
+        EmergencyForegroundService.EXTRA_ROUTE_DEVIATION_DURATION_SECONDS,
+        positiveInt(config, "routeDeviationDurationSeconds", 20),
+      )
+      putExtra(
+        EmergencyForegroundService.EXTRA_ROUTE_PATH_JSON,
+        routePathJson(config),
       )
       putExtra(
         EmergencyForegroundService.EXTRA_MODEL_ID,
@@ -95,6 +139,236 @@ class EmergencyNativeModule(
       action = EmergencyForegroundService.ACTION_DEV_TRIGGER
     })
     promise.resolve(true)
+  }
+
+  @ReactMethod
+  fun getCurrentLocation(promise: Promise) {
+    if (!hasLocationPermission()) {
+      promise.reject("LOCATION_DENIED", "Location permission is not granted.")
+      return
+    }
+
+    val locationManager = reactContext.getSystemService(Context.LOCATION_SERVICE) as LocationManager
+    val lastKnown = bestLastKnownLocation(locationManager)
+    if (lastKnown != null) {
+      promise.resolve(locationMap(lastKnown))
+      return
+    }
+
+    val providers = listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)
+      .filter { provider -> runCatching { locationManager.isProviderEnabled(provider) }.getOrDefault(false) }
+    if (providers.isEmpty()) {
+      promise.reject("LOCATION_PROVIDER_DISABLED", "No location provider is enabled.")
+      return
+    }
+
+    val resolved = booleanArrayOf(false)
+    val handler = Handler(Looper.getMainLooper())
+    val listener = object : LocationListener {
+      override fun onLocationChanged(location: Location) {
+        if (resolved[0]) return
+        resolved[0] = true
+        runCatching { locationManager.removeUpdates(this) }
+        promise.resolve(locationMap(location))
+      }
+
+      @Deprecated("Deprecated in Android API")
+      override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) = Unit
+
+      override fun onProviderEnabled(provider: String) = Unit
+
+      override fun onProviderDisabled(provider: String) = Unit
+    }
+
+    handler.postDelayed({
+      if (!resolved[0]) {
+        resolved[0] = true
+        runCatching { locationManager.removeUpdates(listener) }
+        promise.reject("LOCATION_TIMEOUT", "Timed out while waiting for current location.")
+      }
+    }, 10_000L)
+
+    providers.forEach { provider ->
+      runCatching {
+        locationManager.requestLocationUpdates(
+          provider,
+          0L,
+          0f,
+          listener,
+          Looper.getMainLooper(),
+        )
+      }
+    }
+  }
+
+  @ReactMethod
+  fun getCurrentHeading(promise: Promise) {
+    val sensorManager = reactContext.getSystemService(Context.SENSOR_SERVICE) as SensorManager
+    val rotationSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+    if (rotationSensor == null) {
+      promise.reject("HEADING_UNAVAILABLE", "Rotation vector sensor is not available.")
+      return
+    }
+
+    val resolved = booleanArrayOf(false)
+    val handler = Handler(Looper.getMainLooper())
+    lateinit var listener: SensorEventListener
+    listener = object : SensorEventListener {
+      override fun onSensorChanged(event: SensorEvent) {
+        if (resolved[0]) return
+        resolved[0] = true
+        sensorManager.unregisterListener(this)
+        val rotationMatrix = FloatArray(9)
+        val orientation = FloatArray(3)
+        SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
+        SensorManager.getOrientation(rotationMatrix, orientation)
+        var heading = Math.toDegrees(orientation[0].toDouble())
+        if (heading < 0) {
+          heading += 360.0
+        }
+        promise.resolve(
+          Arguments.createMap().apply {
+            putDouble("heading", heading)
+          },
+        )
+      }
+
+      override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
+    }
+
+    handler.postDelayed({
+      if (!resolved[0]) {
+        resolved[0] = true
+        sensorManager.unregisterListener(listener)
+        promise.reject("HEADING_TIMEOUT", "Timed out while waiting for current heading.")
+      }
+    }, 2_000L)
+
+    sensorManager.registerListener(
+      listener,
+      rotationSensor,
+      SensorManager.SENSOR_DELAY_UI,
+      handler,
+    )
+  }
+
+  @ReactMethod
+  fun startRouteStatusUpdates(promise: Promise) {
+    if (!hasLocationPermission()) {
+      promise.reject("LOCATION_DENIED", "Location permission is not granted.")
+      return
+    }
+
+    stopRouteStatusUpdatesInternal()
+
+    val locationManager = reactContext.getSystemService(Context.LOCATION_SERVICE) as LocationManager
+    val providers = listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)
+      .filter { provider -> runCatching { locationManager.isProviderEnabled(provider) }.getOrDefault(false) }
+    if (providers.isEmpty()) {
+      promise.reject("LOCATION_PROVIDER_DISABLED", "No location provider is enabled.")
+      return
+    }
+
+    routeStatusLocationManager = locationManager
+    routeStatusLastLocation = bestLastKnownLocation(locationManager)
+    routeStatusLastLocation?.let { emitRouteStatusLocation(it) }
+
+    val locationListener = object : LocationListener {
+      override fun onLocationChanged(location: Location) {
+        routeStatusLastLocation = location
+        if (routeStatusHeading == null && location.hasBearing()) {
+          routeStatusHeading = location.bearing.toDouble()
+        }
+        emitRouteStatusLocation(location)
+      }
+
+      @Deprecated("Deprecated in Android API")
+      override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) = Unit
+
+      override fun onProviderEnabled(provider: String) = Unit
+
+      override fun onProviderDisabled(provider: String) = Unit
+    }
+    routeStatusLocationListener = locationListener
+
+    providers.forEach { provider ->
+      runCatching {
+        locationManager.requestLocationUpdates(
+          provider,
+          500L,
+          0.5f,
+          locationListener,
+          Looper.getMainLooper(),
+        )
+      }
+    }
+
+    val sensorManager = reactContext.getSystemService(Context.SENSOR_SERVICE) as SensorManager
+    val rotationSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+    if (rotationSensor != null) {
+      val sensorListener = object : SensorEventListener {
+        override fun onSensorChanged(event: SensorEvent) {
+          routeStatusHeading = headingFromRotationVector(event.values)
+          val now = System.currentTimeMillis()
+          if (now - routeStatusLastHeadingEmitAt >= 250L) {
+            routeStatusLastHeadingEmitAt = now
+            routeStatusLastLocation?.let { emitRouteStatusLocation(it) }
+          }
+        }
+
+        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
+      }
+      routeStatusSensorManager = sensorManager
+      routeStatusSensorListener = sensorListener
+      sensorManager.registerListener(
+        sensorListener,
+        rotationSensor,
+        SensorManager.SENSOR_DELAY_UI,
+        mainHandler,
+      )
+    }
+
+    promise.resolve(true)
+  }
+
+  @ReactMethod
+  fun stopRouteStatusUpdates(promise: Promise) {
+    stopRouteStatusUpdatesInternal()
+    promise.resolve(true)
+  }
+
+  @ReactMethod
+  fun startRouteCapture(start: ReadableMap, promise: Promise) {
+    if (!hasLocationPermission()) {
+      promise.reject("LOCATION_DENIED", "Location permission is not granted.")
+      return
+    }
+    if (!start.hasKey("latitude") || !start.hasKey("longitude")) {
+      promise.reject("ROUTE_CAPTURE_INVALID_START", "Start location is missing.")
+      return
+    }
+
+    val intent = Intent(reactContext, RouteCaptureForegroundService::class.java).apply {
+      action = RouteCaptureForegroundService.ACTION_START
+      putExtra(RouteCaptureForegroundService.EXTRA_START_LATITUDE, start.getDouble("latitude"))
+      putExtra(RouteCaptureForegroundService.EXTRA_START_LONGITUDE, start.getDouble("longitude"))
+    }
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+      reactContext.startForegroundService(intent)
+    } else {
+      reactContext.startService(intent)
+    }
+    promise.resolve(true)
+  }
+
+  @ReactMethod
+  fun stopRouteCapture(promise: Promise) {
+    val snapshot = RouteCaptureForegroundService.finishActiveCapture()
+    if (snapshot == null) {
+      promise.reject("ROUTE_CAPTURE_NOT_RUNNING", "Route capture service is not running.")
+      return
+    }
+    promise.resolve(snapshot)
   }
 
   @ReactMethod
@@ -158,9 +432,35 @@ class EmergencyNativeModule(
     promise.resolve(true)
   }
 
+  private fun analysisWindowSeconds(config: ReadableMap, key: String, fallback: Int): Int {
+    if (!config.hasKey(key)) return fallback
+    return runCatching { config.getDouble(key).toInt().coerceIn(1, 30) }.getOrDefault(fallback)
+  }
+
+  private fun positiveInt(config: ReadableMap, key: String, fallback: Int): Int {
+    if (!config.hasKey(key)) return fallback
+    return runCatching { config.getDouble(key).toInt().coerceAtLeast(1) }.getOrDefault(fallback)
+  }
+
+  private fun routePathJson(config: ReadableMap): String {
+    if (!config.hasKey("routePath")) return "[]"
+    val routePath = config.getArray("routePath") ?: return "[]"
+    val json = JSONArray()
+    for (index in 0 until routePath.size()) {
+      val point = routePath.getMap(index) ?: continue
+      if (!point.hasKey("latitude") || !point.hasKey("longitude")) continue
+      json.put(
+        JSONObject()
+          .put("latitude", point.getDouble("latitude"))
+          .put("longitude", point.getDouble("longitude")),
+      )
+    }
+    return json.toString()
+  }
+
   @ReactMethod
   fun loadAppSettings(promise: Promise) {
-    promise.resolve(preferences.getString("app_settings", """{"sttEngine":"off","customPrompt":"","audioRmsThreshold":0.35}"""))
+    promise.resolve(preferences.getString("app_settings", """{"sttEngine":"off","sirenEnabled":false,"customPrompt":"","sensorThreshold":28,"gyroThreshold":8,"audioRmsThreshold":0.35,"preTriggerSeconds":10,"postTriggerSeconds":7,"routeDeviationDistanceMeters":50,"routeDeviationDurationSeconds":20}"""))
   }
 
   @ReactMethod
@@ -213,7 +513,11 @@ class EmergencyNativeModule(
       return
     }
 
-    val destination = payload.getString("destination") ?: "01082014333"
+    val destination = payload.getString("destination")?.trim().orEmpty()
+    if (destination.isEmpty()) {
+      promise.reject("SMS_DESTINATION_EMPTY", "Emergency phone number is empty.")
+      return
+    }
     val summary = payload.getString("situation_summary") ?: "위급 상황이 감지되었습니다."
     val location = payload.getMap("location")
     val mapLink =
@@ -257,6 +561,66 @@ class EmergencyNativeModule(
 
   @ReactMethod
   fun removeListeners(count: Double) = Unit
+
+  private fun hasLocationPermission(): Boolean =
+    ContextCompat.checkSelfPermission(reactContext, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+      ContextCompat.checkSelfPermission(reactContext, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+
+  private fun bestLastKnownLocation(locationManager: LocationManager): Location? {
+    val providers = listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)
+    return providers
+      .mapNotNull { provider -> runCatching { locationManager.getLastKnownLocation(provider) }.getOrNull() }
+      .maxByOrNull { it.time }
+  }
+
+  private fun locationMap(location: Location) =
+    Arguments.createMap().apply {
+      putDouble("latitude", location.latitude)
+      putDouble("longitude", location.longitude)
+      if (location.hasAccuracy()) {
+        putDouble("accuracy", location.accuracy.toDouble())
+      }
+      if (location.hasBearing()) {
+        putDouble("heading", location.bearing.toDouble())
+      }
+      putDouble("timestamp", location.time.toDouble())
+    }
+
+  private fun stopRouteStatusUpdatesInternal() {
+    routeStatusLocationListener?.let { listener ->
+      runCatching { routeStatusLocationManager?.removeUpdates(listener) }
+    }
+    routeStatusSensorListener?.let { listener ->
+      runCatching { routeStatusSensorManager?.unregisterListener(listener) }
+    }
+    routeStatusLocationManager = null
+    routeStatusLocationListener = null
+    routeStatusSensorManager = null
+    routeStatusSensorListener = null
+    routeStatusLastLocation = null
+    routeStatusHeading = null
+    routeStatusLastHeadingEmitAt = 0L
+  }
+
+  private fun emitRouteStatusLocation(location: Location) {
+    val event = locationMap(location)
+    routeStatusHeading?.let { heading ->
+      event.putDouble("heading", heading)
+    }
+    EmergencyEventBus.emit("routeStatusLocation", event)
+  }
+
+  private fun headingFromRotationVector(values: FloatArray): Double {
+    val rotationMatrix = FloatArray(9)
+    val orientation = FloatArray(3)
+    SensorManager.getRotationMatrixFromVector(rotationMatrix, values)
+    SensorManager.getOrientation(rotationMatrix, orientation)
+    var heading = Math.toDegrees(orientation[0].toDouble())
+    if (heading < 0) {
+      heading += 360.0
+    }
+    return heading
+  }
 
   private fun smsStatusMap(destination: String, parts: Int) =
     Arguments.createMap().apply {

@@ -14,11 +14,14 @@ object GemmaPromptStore {
   private const val LEGACY_PREF_KEY = "gemma_prompt_overrides"
   private const val PREF_KEY_ADULT = "gemma_prompt_overrides_adult"
   private const val PREF_KEY_CHILD = "gemma_prompt_overrides_child"
+  private const val KOREAN_RESPONSE_RULE =
+    "All JSON string values MUST be written in Korean. Do not answer in English except fixed JSON keys and enum values."
 
   private val adultFallbackTemplates = PromptTemplates(
     system = """
       You are the automated emergency judge for OnGuard AI, an on-device emergency detection system.
       Judge Korean audio for real emergency threats while minimizing false alarms.
+      $KOREAN_RESPONSE_RULE
       Return only one valid raw JSON object. No markdown, no backticks, no introductory text.
     """.trimIndent(),
     primary = """
@@ -39,6 +42,7 @@ object GemmaPromptStore {
     system = """
       You are the elite automated judge for OnGuard AI, an on-device child protection and abduction prevention system.
       Detect child luring, grooming, and kidnapping attempts in Korean audio. Calm and friendly tones can still be dangerous.
+      $KOREAN_RESPONSE_RULE
       Return only one valid raw JSON object. No markdown, no backticks, no introductory text.
     """.trimIndent(),
     primary = """
@@ -91,14 +95,21 @@ object GemmaPromptStore {
     locationText: String,
     triggerSource: String,
     customPromptText: String,
-  ): String = applyTemplate(
-    loadTemplates(context, monitoringMode).primary,
-    mapOf(
-      "sampleRate" to sampleRate.toString(),
-      "locationText" to locationText,
-      "triggerSource" to triggerSource,
-      "previousContext" to "",
+    preTriggerSeconds: Int = 10,
+    routeDeviation: Boolean = false,
+  ): String = appendRouteDeviationContext(
+    applyTemplate(
+      loadTemplates(context, monitoringMode).primary,
+      mapOf(
+        "sampleRate" to sampleRate.toString(),
+        "locationText" to locationText,
+        "triggerSource" to triggerSource,
+        "previousContext" to "",
+        "preTriggerSeconds" to preTriggerSeconds.toString(),
+        "routeDeviation" to routeDeviation.toString(),
+      ),
     ),
+    routeDeviation,
   )
 
   fun secondaryPrompt(
@@ -109,14 +120,21 @@ object GemmaPromptStore {
     triggerSource: String,
     previousContext: String,
     customPromptText: String,
-  ): String = applyTemplate(
-    loadTemplates(context, monitoringMode).secondary,
-    mapOf(
-      "sampleRate" to sampleRate.toString(),
-      "locationText" to locationText,
-      "triggerSource" to triggerSource,
-      "previousContext" to previousContext,
+    postTriggerSeconds: Int = 7,
+    routeDeviation: Boolean = false,
+  ): String = appendRouteDeviationContext(
+    applyTemplate(
+      loadTemplates(context, monitoringMode).secondary,
+      mapOf(
+        "sampleRate" to sampleRate.toString(),
+        "locationText" to locationText,
+        "triggerSource" to triggerSource,
+        "previousContext" to previousContext,
+        "postTriggerSeconds" to postTriggerSeconds.toString(),
+        "routeDeviation" to routeDeviation.toString(),
+      ),
     ),
+    routeDeviation,
   )
 
   fun normalizeMode(mode: String?): String =
@@ -127,11 +145,12 @@ object GemmaPromptStore {
     val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     val overrideJson = prefs.getString(prefKeyFor(mode), null)
       ?: if (mode == MODE_ADULT) prefs.getString(LEGACY_PREF_KEY, null) else null
-    return if (overrideJson.isNullOrBlank()) {
+    val templates = if (overrideJson.isNullOrBlank()) {
       loadDefaultTemplates(context, mode)
     } else {
       runCatching { parseTemplates(overrideJson) }.getOrElse { loadDefaultTemplates(context, mode) }
     }
+    return ensureKoreanResponseRule(templates)
   }
 
   private fun loadDefaultTemplates(context: Context, monitoringMode: String?): PromptTemplates {
@@ -184,6 +203,13 @@ object GemmaPromptStore {
   private fun fallbackTemplatesFor(mode: String): PromptTemplates =
     if (mode == MODE_CHILD) childFallbackTemplates else adultFallbackTemplates
 
+  private fun ensureKoreanResponseRule(templates: PromptTemplates): PromptTemplates {
+    if (templates.system.contains(KOREAN_RESPONSE_RULE)) {
+      return templates
+    }
+    return templates.copy(system = "${templates.system}\n$KOREAN_RESPONSE_RULE")
+  }
+
   private fun templatesToJson(templates: PromptTemplates): JSONObject =
     JSONObject()
       .put("system", templates.system)
@@ -194,6 +220,15 @@ object GemmaPromptStore {
     values.entries.fold(template) { current, entry ->
       current.replace("{{${entry.key}}}", entry.value)
     }
+
+  private fun appendRouteDeviationContext(prompt: String, routeDeviation: Boolean): String {
+    val description = if (routeDeviation) {
+      "사용자가 평소 저장된 귀가 경로에서 벗어난 상태입니다. 아동 모드에서는 유인/유괴 위험 판단을 강화하는 보조 정황으로 사용하고, 성인 모드에서는 미행/위협 판단의 보조 정황으로만 사용하십시오."
+    } else {
+      "현재 위치는 저장된 귀가 경로 이탈 상태가 아닙니다."
+    }
+    return "$prompt\n\n[Route deviation context]\n- route_deviation: $routeDeviation\n- route_deviation_description: $description"
+  }
 }
 
 data class PromptTemplates(

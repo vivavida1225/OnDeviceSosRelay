@@ -3,6 +3,7 @@ import {NativeEventEmitter, NativeModules, Platform} from 'react-native';
 export type EmergencyLocation = {
   latitude: number;
   longitude: number;
+  heading?: number;
 };
 
 export type SttEngine = 'off' | 'sherpa-onnx-moonshine-tiny-ko-quantized-2026-02-27';
@@ -20,6 +21,19 @@ export type RoutePathPoint = {
   longitude: number;
 };
 
+export type SavedRoute = {
+  id: string;
+  name: string;
+  isActive: boolean;
+  start: RoutineLocation;
+  end: RoutineLocation;
+  waypoints: RoutePathPoint[];
+  startHour: string;
+  startMinute: string;
+  destinationHour: string;
+  destinationMinute: string;
+};
+
 export type SafetyProfile = {
   mode: SafetyMode | null;
   birthday: string;
@@ -29,6 +43,8 @@ export type SafetyProfile = {
   startLocation: RoutineLocation | null;
   destinationLocation: RoutineLocation | null;
   childRoutePath: RoutePathPoint[];
+  savedRoutes: SavedRoute[];
+  activeRouteId: string;
   startHour: string;
   startMinute: string;
   destinationHour: string;
@@ -45,6 +61,7 @@ export type EmergencyAnalysis = {
   is_emergency: boolean;
   crime_type: string;
   situation_summary: string;
+  route_deviation?: boolean;
   location?: EmergencyLocation;
   model_id?: string;
   trigger_source?: string;
@@ -68,7 +85,13 @@ export type EmergencyAnalysis = {
 export type MonitoringConfig = {
   modelId: string;
   sensorThreshold: number;
+  gyroThreshold: number;
   audioRmsThreshold: number;
+  preTriggerSeconds: number;
+  postTriggerSeconds: number;
+  routeDeviationDistanceMeters: number;
+  routeDeviationDurationSeconds: number;
+  routePath: RoutePathPoint[];
   sttEnabled: boolean;
   sttEngine: SttEngine;
   monitoringMode: SafetyMode;
@@ -77,8 +100,15 @@ export type MonitoringConfig = {
 
 export type AppSettings = {
   sttEngine: SttEngine;
+  sirenEnabled: boolean;
   customPrompt: string;
+  sensorThreshold: number;
+  gyroThreshold: number;
   audioRmsThreshold: number;
+  preTriggerSeconds: number;
+  postTriggerSeconds: number;
+  routeDeviationDistanceMeters: number;
+  routeDeviationDurationSeconds: number;
   safetyProfile: SafetyProfile;
 };
 
@@ -93,11 +123,23 @@ export type AudioLogEntry = {
   analysis_pass?: string;
 };
 
+export type RouteCaptureResult = {
+  start: EmergencyLocation;
+  end: EmergencyLocation;
+  waypoints: RoutePathPoint[];
+};
+
 type EmergencyNativeModule = {
   startMonitoring(config: MonitoringConfig): Promise<boolean>;
   stopMonitoring(): Promise<boolean>;
   cancelPendingReport(): Promise<boolean>;
   triggerDevEmergency(): Promise<boolean>;
+  getCurrentLocation(): Promise<EmergencyLocation & {accuracy?: number; timestamp?: number}>;
+  getCurrentHeading(): Promise<{heading: number}>;
+  startRouteStatusUpdates(): Promise<boolean>;
+  stopRouteStatusUpdates(): Promise<boolean>;
+  startRouteCapture(start: EmergencyLocation): Promise<boolean>;
+  stopRouteCapture(): Promise<RouteCaptureResult>;
   startSiren(durationMs: number): Promise<boolean>;
   stopSiren(): Promise<boolean>;
   loadAnalysisLogs(): Promise<string>;
@@ -137,14 +179,46 @@ const missingModule = (name: string) => {
   throw new Error(`${name} is only available on Android native builds.`);
 };
 
+const nativeEmergencyNative =
+  Platform.OS === 'android'
+    ? (NativeModules.EmergencyNative as Partial<EmergencyNativeModule> | undefined)
+    : undefined;
+
+if (
+  nativeEmergencyNative &&
+  typeof nativeEmergencyNative.getCurrentHeading !== 'function'
+) {
+  nativeEmergencyNative.getCurrentHeading = () => Promise.resolve({heading: 0});
+}
+
+if (
+  nativeEmergencyNative &&
+  typeof nativeEmergencyNative.startRouteStatusUpdates !== 'function'
+) {
+  nativeEmergencyNative.startRouteStatusUpdates = () => Promise.resolve(false);
+}
+
+if (
+  nativeEmergencyNative &&
+  typeof nativeEmergencyNative.stopRouteStatusUpdates !== 'function'
+) {
+  nativeEmergencyNative.stopRouteStatusUpdates = () => Promise.resolve(false);
+}
+
 export const EmergencyNative: EmergencyNativeModule =
-  Platform.OS === 'android' && NativeModules.EmergencyNative
-    ? NativeModules.EmergencyNative
+  nativeEmergencyNative
+    ? (nativeEmergencyNative as EmergencyNativeModule)
     : {
         startMonitoring: () => missingModule('EmergencyNative'),
         stopMonitoring: () => missingModule('EmergencyNative'),
         cancelPendingReport: () => missingModule('EmergencyNative'),
         triggerDevEmergency: () => missingModule('EmergencyNative'),
+        getCurrentLocation: () => missingModule('EmergencyNative'),
+        getCurrentHeading: () => missingModule('EmergencyNative'),
+        startRouteStatusUpdates: () => missingModule('EmergencyNative'),
+        stopRouteStatusUpdates: () => missingModule('EmergencyNative'),
+        startRouteCapture: () => missingModule('EmergencyNative'),
+        stopRouteCapture: () => missingModule('EmergencyNative'),
         startSiren: () => missingModule('EmergencyNative'),
         stopSiren: () => missingModule('EmergencyNative'),
         loadAnalysisLogs: () => missingModule('EmergencyNative'),

@@ -13,6 +13,7 @@ export type AppMode =
 export type EmergencyState = {
   mode: AppMode;
   countdown: number;
+  analysisPass?: 'primary' | 'secondary';
   analysis?: EmergencyAnalysis;
   error?: string;
   lastSmsStatus?: string;
@@ -22,6 +23,7 @@ export type EmergencyAction =
   | {type: 'START_REQUESTED'}
   | {type: 'SERVICE_STATUS'; status: string}
   | {type: 'TRIGGER_DETECTED'}
+  | {type: 'ANALYSIS_PASS_STARTED'; analysisPass: 'primary' | 'secondary'}
   | {type: 'ANALYSIS_RESULT'; analysis: EmergencyAnalysis}
   | {type: 'COUNTDOWN_TICK'}
   | {type: 'CANCEL_REPORT'}
@@ -40,10 +42,10 @@ export function emergencyReducer(
 ): EmergencyState {
   switch (action.type) {
     case 'START_REQUESTED':
-      return {...state, mode: 'warming', error: undefined};
+      return {...state, mode: 'warming', analysisPass: undefined, error: undefined};
     case 'SERVICE_STATUS':
       if (action.status === 'monitoring') {
-        return {...state, mode: 'monitoring', countdown: 5, error: undefined};
+        return {...state, mode: 'monitoring', countdown: 5, analysisPass: undefined, error: undefined};
       }
       if (action.status === 'analyzing') {
         return {...state, mode: 'analyzing'};
@@ -53,15 +55,18 @@ export function emergencyReducer(
       }
       return state;
     case 'TRIGGER_DETECTED':
-      return {...state, mode: 'analyzing'};
+      return {...state, mode: 'analyzing', analysisPass: 'primary'};
+    case 'ANALYSIS_PASS_STARTED':
+      return {...state, mode: 'analyzing', analysisPass: action.analysisPass};
     case 'ANALYSIS_RESULT':
       if (!action.analysis.is_emergency) {
-        return {...state, mode: 'monitoring', analysis: action.analysis};
+        return {...state, mode: 'monitoring', analysisPass: undefined, analysis: action.analysis};
       }
       return {
         ...state,
         mode: 'countdown',
         countdown: 5,
+        analysisPass: undefined,
         analysis: action.analysis,
       };
     case 'COUNTDOWN_TICK':
